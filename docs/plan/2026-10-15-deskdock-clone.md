@@ -397,3 +397,24 @@ under "Open checks".
   `LoadImageW` on the built exe (loaded as a data file) at 16x16 returns, for groups 1/2/3, the
   pointer, the empty teal screen and the dark screen, pixel for pixel as rendered. Open check: watch
   the tray icon change while crossing, and go dark when the tablet's Wi-Fi is off.
+
+### Tablet side in the background (2026-10-16)
+- Question from the user: can the tablet side run purely in the background?
+- Findings (adb, read-only): it already does. Nothing on the tablet opens a window; the server
+  daemon starts `EdgeService` with `start-foreground-service`. `dumpsys activity` shows it as a
+  foreground service (procState 4, oom adj 200, `hasOverlayUi=true`). The `IMPORTANCE_MIN` channel
+  is raised to importance 2 (LOW) because foreground-service notifications cannot be MIN; HarmonyOS
+  still shows no status bar icon for it (screenshot), only a silent ongoing entry in the shade.
+- Why the app and its notification stay: the overlay strip is the only signal that the tablet
+  pointer reached the return edge. On this device (API 31) `dumpsys input` (17 ms) has no pointer
+  position, so decision 18's deferred `dumpsys input` fallback is not possible here; dead reckoning
+  in the server would drift with Android's pointer acceleration. The notification belongs to the
+  foreground service the thaw relies on: PowerGenie freezes the app about 1 s after every thaw even
+  as a foreground service (M2), and the server thaws it with `cmd activity start-foreground-service`;
+  a service started that way must post its notification within seconds or Android stops the app.
+  Untested: a plain `start-service` (the app is deviceidle-whitelisted) with only the overlay, which
+  would need no notification.
+- Decision (user): keep it as it is. Alternatives offered and declined: the user turning off the
+  "Edge strip" notification category (untested on HarmonyOS: may trade it for a system "running in
+  background" notice or a frozen app), and a server-only design without the APK.
+- Impact: none on code.
