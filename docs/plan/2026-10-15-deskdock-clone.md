@@ -320,3 +320,17 @@ under "Open checks".
 - Verification: `cargo.exe test -p wadisplay-pc` (7, incl. `set_ini_key`) and `cargo.exe check` pass.
   Open check: pick each side from the tray, confirm the strip moves to the other tablet edge and the
   ini changes.
+
+### Tablet IME toolbar and candidate placement (2026-10-15)
+- Question from the user: can Huawei's IME toolbar be hidden, and why do Chinese candidates appear far
+  from the input field?
+- Findings: Huawei's 小艺输入法 (`com.huawei.ohos.inputmethod`) shows its compact toolbar whenever a
+  hardware keyboard exists; none of its preference screens (pinyin, wubi, English, clipboard, ...)
+  has a switch for it or for candidate placement, and `show_ime_with_hard_keyboard` does not affect
+  it. In wadisplay's own test field the candidates sit right under the cursor; the user sees them
+  drift in terminal apps, which draw their own text and do not report the cursor position to the IME
+  (CursorAnchorInfo), so the IME falls back to a default spot. wadisplay cannot change either.
+- Decision (user): keep the toolbar as it is. Alternatives offered and declined: switching to another
+  Chinese IME while the tablet has control, or to a UI-less English-only IME.
+- Impact: none on code. Verification: IME resources inspected read-only (`aapt2 dump`); placement
+  in the test field from the earlier screenshot.
