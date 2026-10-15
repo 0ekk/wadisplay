@@ -52,6 +52,10 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
     the left/right", checked = current); the choice is written back to `side=` and the tablet server
     is relaunched with it. Settings and log live in `%LOCALAPPDATA%\wadisplay\` (per-user,
     machine-specific data), not next to the exe.
+21. (2026-10-16, user request: an intuitive icon) One picture everywhere: a monitor with a portrait
+    tablet standing in front of its right side and a mouse pointer on the tablet screen ("the PC's
+    pointer is on the tablet"). Used for the exe/tray icon, the APK launcher icon and, as a white
+    silhouette, the tablet's notification icon.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -131,9 +135,10 @@ PC (wadisplay.exe, elevated)                   Tablet
 - `Cargo.toml` (workspace), `proto/src/lib.rs`
 - `pc/src/main.rs`, `pc/src/capture.rs` (hooks, raw input, clip), `pc/src/switch.rs` (pure crossing
   state machine), `pc/src/keymap.rs` (scancode -> HID usage), `pc/src/adb.rs`, `pc/src/tray.rs`,
-  `pc/wadisplay.exe.manifest` (requireAdministrator, PerMonitorV2 DPI)
+  `pc/wadisplay.exe.manifest` (requireAdministrator, PerMonitorV2 DPI), `pc/icon/` (icon sources + PNGs)
 - `server/src/main.rs`, `server/src/uhid.rs`, `server/src/warp.rs`
-- `android/` (Gradle wrapper, `app/src/main/AndroidManifest.xml`, `EdgeService.kt`, `MainActivity.kt`)
+- `android/` (Gradle wrapper, `app/src/main/AndroidManifest.xml`, `EdgeService.kt`, `MainActivity.kt`,
+  `res/` launcher and notification icons)
 - `AGENTS.md` (build/test/deploy commands), `docs/plan/2026-10-15-deskdock-clone.md` (this design +
   per-milestone rationale/decisions/impact/verification)
 - Crates: `windows`, `chacha20poly1305`, `getrandom`, `libc`. Nothing else without asking.
@@ -334,3 +339,35 @@ under "Open checks".
   Chinese IME while the tablet has control, or to a UI-less English-only IME.
 - Impact: none on code. Verification: IME resources inspected read-only (`aapt2 dump`); placement
   in the test field from the earlier screenshot.
+
+### App icon (2026-10-16, decision 21)
+- Rationale: the tray showed the generic Windows application icon and the APK the default Android
+  one, so neither said what the program does. A monitor with a tablet beside it and the pointer on
+  the tablet is what wadisplay does.
+- Decisions:
+  - Sources in `pc/icon/`: `wadisplay.svg` (32-unit grid, used for 32/48/256 px) and
+    `wadisplay-16.svg` (hand-placed pixels, `crispEdges`, for the 16 px tray size, where a scaled
+    vector blurs the 1-unit outlines). The committed PNGs are rendered with `rsvg-convert` (command
+    in AGENTS.md). Colors: slate frames `#64748b`, blue monitor screen `#3b82f6`, teal tablet screen
+    `#14b8a6`, white pointer with a `#0f172a` outline; mid-tone fills read on dark and light
+    taskbars. A 2-unit gap separates the tablet from the monitor behind it.
+  - `pc/build.rs` writes `icon.res` itself (RT_ICON 1-4 holding the PNGs, RT_GROUP_ICON 1) and passes
+    it to link.exe, so no rc.exe, Windows SDK lookup or new crate is needed. PNG images in icon
+    resources load on Windows Vista and later at every size. No 20/24 px images: Windows scales the
+    32 px one down for 125%/150% DPI.
+  - The tray loads group icon 1 with `LoadImageW` at `SM_CXSMICON` (system DPI).
+  - Android: adaptive launcher icon (`mipmap-anydpi-v26/ic_launcher.xml`, white background, vector
+    foreground scaled into the 66 dp safe circle; vector drawables have no masks, so the gap is
+    painted white). Notification icon `drawable/ic_stat_wadisplay.xml`: white silhouette, the
+    monitor outline open where the tablet stands, a smaller pointer kept inside the tablet outline.
+  - Not done: a different tray icon per state (PC/tablet/offline); the tooltip already says it.
+- Impact: `pc/build.rs` links the icon into the exe only (`rustc-link-arg-bins`); the lib tests are
+  unchanged. `AndroidManifest.xml` and `EdgeService` use the new resources; the APK hash changes, so
+  the next exe start redeploys it.
+- Verification: release exe built (in a second target dir, the user's exe was running); the PE
+  resource table holds RT_ICON 1-4 (16, 32, 48, 256 px, 32 bpp) and RT_GROUP_ICON 1. Shell
+  `ExtractIconEx` on the exe returned 32x32 and 16x16 icons; the 16 px one matches
+  `wadisplay-16.svg` pixel for pixel. `aapt dump badging` reports
+  `icon='res/mipmap-anydpi-v26/ic_launcher.xml'`; both vectors rendered through an SVG conversion
+  look as designed. `cargo.exe test -p wadisplay-pc` (7) passes. Open check: the icon in the tray,
+  the UAC prompt, Explorer, the tablet launcher and the tablet status bar.

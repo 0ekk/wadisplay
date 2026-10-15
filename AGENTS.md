@@ -10,7 +10,8 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
   NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts (`main.rs`).
 - `pc/`: `wadisplay.exe` (Windows, elevated via manifest). Hooks/Raw Input/cursor parking (`capture.rs`),
   adb deploy/launch (`adb.rs`), tray (`tray.rs`). Pure logic (`switch.rs`, `keymap.rs`) is the lib, so
-  tests never link the requireAdministrator manifest.
+  tests never link the requireAdministrator manifest. `build.rs` links the manifest and `icon/*.png`
+  (as a hand-written `.res`) into the exe.
 - `android/`: companion APK `com.wadisplay.companion` (`EdgeService` overlay strip, `MainActivity`
   status + typing test field). No AndroidX.
 
@@ -23,6 +24,13 @@ cargo.exe build --release -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 ```
 The exe is `C:\wadisplay-target\release\wadisplay.exe`. Always pass `--target-dir` on C: to `cargo.exe`
 (builds on `\\wsl.localhost` are slow and `mt.exe` cannot read UNC paths).
+
+After editing `pc/icon/*.svg`, re-render the committed PNGs (the Android vectors in
+`android/app/src/main/res/drawable/` repeat the same paths by hand):
+```sh
+cd pc/icon && rsvg-convert -w 16 -h 16 wadisplay-16.svg -o 16.png &&
+  for s in 32 48 256; do rsvg-convert -w $s -h $s wadisplay.svg -o $s.png; done
+```
 
 ## Test
 ```sh

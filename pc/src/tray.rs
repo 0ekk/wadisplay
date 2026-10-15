@@ -1,7 +1,8 @@
 //! Notification-area icon: tooltip status and a menu (tablet side, Connect/Disconnect, Quit).
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
                                 NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -33,7 +34,10 @@ pub fn add(hwnd: HWND, tip: &str) {
     d.uFlags |= NIF_ICON | NIF_MESSAGE;
     d.uCallbackMessage = WM_TRAY;
     unsafe {
-        d.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        // Group icon 1 from build.rs; Windows picks the closest of 16/32/48/256 and scales it.
+        let inst = GetModuleHandleW(None).ok().map(HINSTANCE::from);
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        d.hIcon = LoadImageW(inst, PCWSTR(1 as _), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR).map(|h| HICON(h.0)).unwrap_or_default();
         let _ = Shell_NotifyIconW(NIM_ADD, &d);
     }
 }

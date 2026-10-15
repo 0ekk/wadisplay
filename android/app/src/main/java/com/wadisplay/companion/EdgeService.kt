@@ -79,7 +79,7 @@ class EdgeService : Service() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("edge", "Edge strip", NotificationManager.IMPORTANCE_MIN))
         val n = Notification.Builder(this, "edge")
-            .setSmallIcon(android.R.drawable.ic_menu_share)
+            .setSmallIcon(R.drawable.ic_stat_wadisplay)
             .setContentTitle("wadisplay")
             .setContentText("Watching the screen edge for the PC mouse")
             .build()
