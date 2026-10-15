@@ -1,0 +1,3 @@
+/* Tray: no tablet connected (no pointer, tablet screen off). */
+#pointer { display: none }
+#tablet-screen { fill: #1e293b }

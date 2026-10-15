@@ -56,6 +56,9 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
     tablet standing in front of its right side and a mouse pointer on the tablet screen ("the PC's
     pointer is on the tablet"). Used for the exe/tray icon, the APK launcher icon and, as a white
     silhouette, the tablet's notification icon.
+22. (2026-10-16, user request) The tray icon shows the state: pointer on the tablet = the tablet has
+    control (the exe icon); no pointer = tablet online, the PC has control; no pointer and a dark
+    tablet screen = no tablet (connecting, silent for 3 s, or disconnected).
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -360,7 +363,7 @@ under "Open checks".
     foreground scaled into the 66 dp safe circle; vector drawables have no masks, so the gap is
     painted white). Notification icon `drawable/ic_stat_wadisplay.xml`: white silhouette, the
     monitor outline open where the tablet stands, a smaller pointer kept inside the tablet outline.
-  - Not done: a different tray icon per state (PC/tablet/offline); the tooltip already says it.
+  - Tray icon per state: decision 22, below.
 - Impact: `pc/build.rs` links the icon into the exe only (`rustc-link-arg-bins`); the lib tests are
   unchanged. `AndroidManifest.xml` and `EdgeService` use the new resources; the APK hash changes, so
   the next exe start redeploys it.
@@ -371,3 +374,26 @@ under "Open checks".
   `icon='res/mipmap-anydpi-v26/ic_launcher.xml'`; both vectors rendered through an SVG conversion
   look as designed. `cargo.exe test -p wadisplay-pc` (7) passes. Open check: the icon in the tray,
   the UAC prompt, Explorer, the tablet launcher and the tablet status bar.
+
+### Tray icon per state (2026-10-16, decision 22)
+- Rationale: the state was only in the tooltip, which needs a hover. The icon now shows where the
+  pointer is and whether the tablet is there.
+- Decisions:
+  - Three pictures, all from the same SVGs: `online.css` hides `#pointer`, `offline.css` also paints
+    `#tablet-screen` `#1e293b` (screen off). `rsvg-convert -s` applies them, so no geometry is
+    copied. "PC has control" shows no pointer instead of a pointer on the monitor: a 5x7 pointer does
+    not fit the 6x7 visible monitor screen at 16 px, and the real pointer is on the PC screen then.
+  - Icon group ids double as `tray::Icon` values: 1 = tablet has control (also the exe icon, 16/32/48/
+    256 px), 2 = PC has control, 3 = offline (16/32 px each; the tray never asks for more).
+    `build.rs` emits one RT_GROUP_ICON per group.
+  - The icon is set with the tooltip (`tray::set`, NIM_MODIFY with NIF_ICON | NIF_TIP), which already
+    runs every second and right after each crossing (`tip_at = now`), so the picture changes with the
+    crossing. `LoadImageW(.., LR_SHARED)` returns one cached handle per group: no handle per update.
+  - State comes from `App::status`, which now returns `(tray::Icon, String)`: offline when paused,
+    no session key, or nothing heard for 3 s; otherwise `st.active` picks tablet or PC.
+- Impact: `tray::set_tip` became `tray::set(hwnd, icon, tip)`; `tray::add` takes the starting icon
+  (offline). `wadisplay.svg`/`wadisplay-16.svg` gained `id`s; the base PNGs render byte-identical.
+- Verification: release build has no warnings; `cargo.exe test -p wadisplay-pc` (7) passes.
+  `LoadImageW` on the built exe (loaded as a data file) at 16x16 returns, for groups 1/2/3, the
+  pointer, the empty teal screen and the dark screen, pixel for pixel as rendered. Open check: watch
+  the tray icon change while crossing, and go dark when the tablet's Wi-Fi is off.

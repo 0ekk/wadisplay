@@ -408,7 +408,8 @@ impl App {
 
         if now >= self.tip_at {
             self.tip_at = now + Duration::from_secs(1);
-            tray::set_tip(self.hwnd, &self.status(now));
+            let (icon, tip) = self.status(now);
+            tray::set(self.hwnd, icon, &tip);
         }
         if now >= self.stats_at && !self.samples.is_empty() {
             self.stats_at = now + Duration::from_secs(60);
@@ -418,14 +419,14 @@ impl App {
         }
     }
 
-    fn status(&self, now: Instant) -> String {
+    fn status(&self, now: Instant) -> (tray::Icon, String) {
         if self.paused {
-            return "wadisplay: disconnected".into();
+            return (tray::Icon::Offline, "wadisplay: disconnected".into());
         }
         if self.key.is_none() || self.heard.map_or(true, |t| now - t > Duration::from_secs(3)) {
-            return format!("wadisplay: {}", self.adb_status);
+            return (tray::Icon::Offline, format!("wadisplay: {}", self.adb_status));
         }
-        let who = if self.st.active { "tablet has control" } else { "PC has control" };
+        let (icon, who) = if self.st.active { (tray::Icon::Tablet, "tablet has control") } else { (tray::Icon::Pc, "PC has control") };
         let (p50, p99) = percentiles(self.samples.iter().map(|s| s.0 / 2 + s.1).collect());
         let mut s = format!("wadisplay: {who}\nlatency {p50:.1} ms, p99 {p99:.1} ms");
         match self.tab {
@@ -434,7 +435,7 @@ impl App {
             _ if !self.st.active && self.blocked => s += "\nfullscreen app: edges off, Ctrl+Alt+Space",
             _ => {}
         }
-        s
+        (icon, s)
     }
 
     fn bye(&mut self) {
@@ -447,7 +448,7 @@ impl App {
     }
 
     fn menu(&mut self) {
-        let status = self.status(Instant::now()).replace('\n', " | ");
+        let status = self.status(Instant::now()).1.replace('\n', " | ");
         match tray::menu(self.hwnd, &status, !self.paused, self.cfg.side) {
             cmd @ (tray::CMD_LEFT | tray::CMD_RIGHT) => {
                 let side = if cmd == tray::CMD_LEFT { Side::Left } else { Side::Right };
@@ -507,7 +508,7 @@ fn run(cfg: Config) {
                         WINEVENT_OUTOFCONTEXT);
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
-    tray::add(hwnd, "wadisplay: starting");
+    tray::add(hwnd, tray::Icon::Offline, "wadisplay: starting");
 
     let sock = UdpSocket::bind("0.0.0.0:0").expect("udp bind");
     sock.connect((cfg.tablet_ip.as_str(), proto::PORT)).expect("udp connect");

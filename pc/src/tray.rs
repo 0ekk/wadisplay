@@ -15,39 +15,52 @@ pub const CMD_QUIT: u32 = 2;
 pub const CMD_LEFT: u32 = 3;
 pub const CMD_RIGHT: u32 = 4;
 
-fn data(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
-    let mut d = NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: hwnd,
-        uID: 1,
-        uFlags: NIF_TIP,
-        ..Default::default()
-    };
+/// The tray picture; values are icon group ids in the exe (build.rs).
+#[derive(Clone, Copy)]
+pub enum Icon {
+    /// Pointer on the tablet.
+    Tablet = 1,
+    /// Tablet online, the PC has control: no pointer.
+    Pc = 2,
+    /// No tablet: no pointer, tablet screen dark.
+    Offline = 3,
+}
+
+fn data(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
+}
+
+fn with(hwnd: HWND, icon: Icon, tip: &str) -> NOTIFYICONDATAW {
+    let mut d = data(hwnd);
+    d.uFlags = NIF_ICON | NIF_TIP;
+    // LR_SHARED: one cached handle per group, so setting it every second leaks nothing.
+    // Windows picks the closest image size and scales it.
+    unsafe {
+        let inst = GetModuleHandleW(None).ok().map(HINSTANCE::from);
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        d.hIcon = LoadImageW(inst, PCWSTR(icon as usize as _), IMAGE_ICON, cx, cy, LR_SHARED)
+            .map(|h| HICON(h.0))
+            .unwrap_or_default();
+    }
     for (dst, src) in d.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
         *dst = src;
     }
     d
 }
 
-pub fn add(hwnd: HWND, tip: &str) {
-    let mut d = data(hwnd, tip);
-    d.uFlags |= NIF_ICON | NIF_MESSAGE;
+pub fn add(hwnd: HWND, icon: Icon, tip: &str) {
+    let mut d = with(hwnd, icon, tip);
+    d.uFlags |= NIF_MESSAGE;
     d.uCallbackMessage = WM_TRAY;
-    unsafe {
-        // Group icon 1 from build.rs; Windows picks the closest of 16/32/48/256 and scales it.
-        let inst = GetModuleHandleW(None).ok().map(HINSTANCE::from);
-        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
-        d.hIcon = LoadImageW(inst, PCWSTR(1 as _), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR).map(|h| HICON(h.0)).unwrap_or_default();
-        let _ = Shell_NotifyIconW(NIM_ADD, &d);
-    }
+    unsafe { let _ = Shell_NotifyIconW(NIM_ADD, &d); }
 }
 
-pub fn set_tip(hwnd: HWND, tip: &str) {
-    unsafe { let _ = Shell_NotifyIconW(NIM_MODIFY, &data(hwnd, tip)); }
+pub fn set(hwnd: HWND, icon: Icon, tip: &str) {
+    unsafe { let _ = Shell_NotifyIconW(NIM_MODIFY, &with(hwnd, icon, tip)); }
 }
 
 pub fn remove(hwnd: HWND) {
-    unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &data(hwnd, "")); }
+    unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &data(hwnd)); }
 }
 
 /// Shows the menu at the cursor; returns the chosen CMD_* (0 = dismissed).

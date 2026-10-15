@@ -25,11 +25,14 @@ cargo.exe build --release -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 The exe is `C:\wadisplay-target\release\wadisplay.exe`. Always pass `--target-dir` on C: to `cargo.exe`
 (builds on `\\wsl.localhost` are slow and `mt.exe` cannot read UNC paths).
 
-After editing `pc/icon/*.svg`, re-render the committed PNGs (the Android vectors in
-`android/app/src/main/res/drawable/` repeat the same paths by hand):
+After editing `pc/icon/*.svg` or `*.css`, re-render the committed PNGs (`online.css`/`offline.css`
+make the tray state variants; the Android vectors in `android/app/src/main/res/drawable/` repeat the
+same paths by hand):
 ```sh
 cd pc/icon && rsvg-convert -w 16 -h 16 wadisplay-16.svg -o 16.png &&
-  for s in 32 48 256; do rsvg-convert -w $s -h $s wadisplay.svg -o $s.png; done
+  for s in 32 48 256; do rsvg-convert -w $s -h $s wadisplay.svg -o $s.png; done &&
+  for st in online offline; do rsvg-convert -s $st.css -w 16 -h 16 wadisplay-16.svg -o $st-16.png &&
+    rsvg-convert -s $st.css -w 32 -h 32 wadisplay.svg -o $st-32.png; done
 ```
 
 ## Test
