@@ -144,13 +144,18 @@ pub fn launch(cfg: &Config) -> Result<[u8; 32], String> {
     Adb { serial: format!("{}:5555", cfg.tablet_ip), cfg }.launch()
 }
 
-/// Serves launch requests until the channel closes; duplicates queued meanwhile are dropped.
-pub fn thread(cfg: Config, rx: Receiver<()>, emit: impl Fn(Event)) {
-    while rx.recv().is_ok() {
+/// Serves launch requests until the channel closes. Requests queued during a launch are
+/// dropped, unless the newest one changes the side.
+pub fn thread(rx: Receiver<Config>, emit: impl Fn(Event)) {
+    let mut next = rx.recv().ok();
+    while let Some(cfg) = next {
         emit(match launch(&cfg) {
             Ok(key) => Event::Launched(key),
             Err(e) => Event::Failed(e),
         });
-        while rx.try_recv().is_ok() {}
+        next = match rx.try_iter().last() {
+            Some(c) if c.side != cfg.side => Some(c),
+            _ => rx.recv().ok(),
+        };
     }
 }

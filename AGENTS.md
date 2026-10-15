@@ -31,9 +31,11 @@ cargo.exe test -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 ```
 
 ## Run
-- Start `wadisplay.exe` (UAC prompt every start). It writes `wadisplay.ini` and `wadisplay.log` next to
-  itself, connects adb to `tablet_ip:5555` (running `adb tcpip 5555` if the tablet is on USB), deploys
-  the server/APK when their hashes change and launches the server.
+- Start `wadisplay.exe` (UAC prompt every start). Settings and log live in `%LOCALAPPDATA%\wadisplay\`
+  (`wadisplay.ini`, created with defaults; `wadisplay.log`, rewritten each start). The tray menu
+  switches the tablet between left and right. It connects adb to `tablet_ip:5555` (running
+  `adb tcpip 5555` if the tablet is on USB), deploys the server/APK when their hashes change and
+  launches the server.
 - Latency bench: `wadisplay.exe --bench [seconds]` (default 60; result in a message box and the log).
 - Tablet side: `adb -s <tablet-ip>:5555 shell cat /data/local/tmp/wadisplay.log`.
 

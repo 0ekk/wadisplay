@@ -48,6 +48,10 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
     crossing while a fullscreen app is in front (`SHQueryUserNotificationState` = QUNS_BUSY or
     QUNS_RUNNING_D3D_FULL_SCREEN) or while another app confines the cursor (`GetClipCursor` smaller
     than the screen); the hotkey still crosses. Returning restores that app's cursor clip.
+20. (2026-10-15, user request) The tray menu switches the tablet between left and right ("Tablet on
+    the left/right", checked = current); the choice is written back to `side=` and the tablet server
+    is relaunched with it. Settings and log live in `%LOCALAPPDATA%\wadisplay\` (per-user,
+    machine-specific data), not next to the exe.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -88,7 +92,8 @@ PC (wadisplay.exe, elevated)                   Tablet
   (Ctrl+Alt+Del, UAC, Win+L). Then unclip, place the cursor at the edge at `return_y`.
 - Send on every input change (coalesce < 1 ms), at least every 30 ms while active, every 1 s while idle.
   Disable power throttling (`SetProcessInformation(ProcessPowerThrottling)`).
-- Config `wadisplay.ini` next to exe (hand-parsed `key=value`): `tablet_ip`, `adb`, `side`, `push_counts`.
+- Config `%LOCALAPPDATA%\wadisplay\wadisplay.ini` (hand-parsed `key=value`): `tablet_ip`, `adb`, `side`,
+  `push_counts`; the log is `wadisplay.log` beside it (decision 20).
 
 ### Server rules
 - Startup: read hex key + app token from stdin; kill old instance via pidfile; fork, `setsid`, fds to
@@ -299,3 +304,19 @@ under "Open checks".
   wadisplay.exe launched its server (server launches replace each other).
 - Verification: `cargo.exe check` and `cargo.exe test -p wadisplay-pc` (6) pass. Not yet run on the
   PC with a fullscreen game: Open check.
+
+### Tray side switch, settings location (2026-10-15, decision 20)
+- Rationale: changing `side` meant editing a file beside the exe and restarting it (a UAC prompt each
+  time); Windows keeps per-user application data under AppData, not in the program's folder.
+- Decisions: `%LOCALAPPDATA%` (Local, not Roaming): the tablet IP and the side describe this PC's
+  desk, not the user's profile. Elevated runs under the same account resolve the same folder. Falls
+  back to the temp folder if the variable is missing. The old `wadisplay.ini` beside the exe was the
+  untouched default, so there is no migration; it can be deleted. Choosing a side: `Bye` to the
+  server, write `side=` with `set_ini_key` (keeps comments and other keys), reset the crossing state
+  (offline until the new server answers), send a launch request carrying the new `Config`. The adb
+  thread drops requests queued during a launch unless the newest one changes the side.
+- Impact: `adb::thread` now takes `Receiver<Config>`; `tray::menu` takes the current side. The menu
+  offers left and right only; `top`/`bottom` still work through the ini.
+- Verification: `cargo.exe test -p wadisplay-pc` (7, incl. `set_ini_key`) and `cargo.exe check` pass.
+  Open check: pick each side from the tray, confirm the strip moves to the other tablet edge and the
+  ini changes.

@@ -39,7 +39,7 @@ pub struct Config {
 }
 
 const DEFAULT_INI: &str = "\
-# wadisplay settings; restart wadisplay.exe after editing.
+# wadisplay settings; restart wadisplay.exe after editing. The tray menu also sets side.
 tablet_ip=
 # adb.exe path, or adb to find it on PATH
 adb=adb
@@ -50,8 +50,12 @@ push_counts=20
 ";
 
 impl Config {
+    fn path() -> PathBuf {
+        data_dir().join("wadisplay.ini")
+    }
+
     fn load() -> Config {
-        let path = exe_dir().join("wadisplay.ini");
+        let path = Config::path();
         let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
             let _ = std::fs::write(&path, DEFAULT_INI);
             DEFAULT_INI.into()
@@ -68,8 +72,18 @@ impl Config {
                 k => log!("wadisplay.ini: unknown key {k}"),
             }
         }
-        log!("config: tablet {} side {} push {} adb {}", c.tablet_ip, c.side.name(), c.push_counts, c.adb);
+        log!("config {}: tablet {} side {} push {} adb {}", path.display(), c.tablet_ip, c.side.name(),
+             c.push_counts, c.adb);
         c
+    }
+
+    /// Rewrites the `side=` line in place.
+    fn save_side(side: Side) {
+        let path = Config::path();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_INI.into());
+        if let Err(e) = std::fs::write(&path, wadisplay_pc::set_ini_key(&text, "side", side.name())) {
+            log!("{}: {e}", path.display());
+        }
     }
 }
 
@@ -87,8 +101,12 @@ pub fn log_line(a: std::fmt::Arguments) {
     }
 }
 
-fn exe_dir() -> PathBuf {
-    std::env::current_exe().unwrap().parent().unwrap().to_path_buf()
+/// Per-user, machine-specific data (settings and log): %LOCALAPPDATA%\wadisplay.
+fn data_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("wadisplay");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 fn now_us() -> u64 {
@@ -178,6 +196,7 @@ fn percentiles(mut v: Vec<u32>) -> (f32, f32) {
 }
 
 struct App {
+    cfg: Config,
     hwnd: HWND,
     hider: HWND,
     sock: UdpSocket,
@@ -199,7 +218,7 @@ struct App {
     key_balance: i64,
     hook_seen: u64,
     balance_since: Option<Instant>,
-    launch: Sender<()>,
+    launch: Sender<Config>,
     launch_at: Option<Instant>,
     paused: bool,
     tab: Option<TabState>,
@@ -377,7 +396,7 @@ impl App {
         if !self.paused && silent && self.launch_at.map_or(true, |t| now - t > Duration::from_secs(10)) {
             self.launch_at = Some(now);
             self.adb_status = "connecting over adb".into();
-            let _ = self.launch.send(());
+            let _ = self.launch.send(self.cfg.clone());
         }
 
         let every = Duration::from_millis(if self.st.active { 30 } else { 1000 });
@@ -429,7 +448,23 @@ impl App {
 
     fn menu(&mut self) {
         let status = self.status(Instant::now()).replace('\n', " | ");
-        match tray::menu(self.hwnd, &status, !self.paused) {
+        match tray::menu(self.hwnd, &status, !self.paused, self.cfg.side) {
+            cmd @ (tray::CMD_LEFT | tray::CMD_RIGHT) => {
+                let side = if cmd == tray::CMD_LEFT { Side::Left } else { Side::Right };
+                if side != self.cfg.side {
+                    log!("tray: tablet on the {}", side.name());
+                    self.bye();
+                    self.cfg.side = side;
+                    self.sw = Switch::new(side, self.cfg.push_counts); // offline until the new server answers
+                    Config::save_side(side);
+                    if !self.paused {
+                        // The server takes the side at launch (warp corner, strip edge).
+                        self.launch_at = Some(Instant::now());
+                        self.adb_status = "restarting the tablet server".into();
+                        let _ = self.launch.send(self.cfg.clone());
+                    }
+                }
+            }
             tray::CMD_CONNECT if self.paused => (self.paused, self.launch_at) = (false, None),
             tray::CMD_CONNECT => {
                 self.bye();
@@ -488,12 +523,11 @@ fn run(cfg: Config) {
         }
     });
     let (launch, launch_rx) = mpsc::channel();
-    let c = cfg.clone();
-    std::thread::spawn(move || adb::thread(c, launch_rx, |e| emit_wake(Ev::Adb(e))));
+    std::thread::spawn(move || adb::thread(launch_rx, |e| emit_wake(Ev::Adb(e))));
 
     let now = Instant::now();
     let mut app = App {
-        hwnd, hider, sock, key: None, tx_seq: 0, rx_seq: 0, st: PcState::default(),
+        cfg: cfg.clone(), hwnd, hider, sock, key: None, tx_seq: 0, rx_seq: 0, st: PcState::default(),
         sw: Switch::new(cfg.side, cfg.push_counts), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None,
         dirty: false, last_send: now, key_balance: 0, hook_seen: capture::HOOK_KEYS.load(Relaxed),
         balance_since: None, launch, launch_at: None, paused: false, tab: None, heard: None,
@@ -570,7 +604,7 @@ fn bench(cfg: &Config, secs: u64) {
 
 fn main() {
     START.get_or_init(Instant::now);
-    if let Ok(f) = File::create(exe_dir().join("wadisplay.log")) {
+    if let Ok(f) = File::create(data_dir().join("wadisplay.log")) {
         let _ = LOG.set(Mutex::new(f));
     }
     std::panic::set_hook(Box::new(|info| {
