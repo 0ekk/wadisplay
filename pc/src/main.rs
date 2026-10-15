@@ -106,6 +106,10 @@ fn screen() -> Rect {
     Rect { l, t, r: l + m(SM_CXVIRTUALSCREEN), b: t + m(SM_CYVIRTUALSCREEN) }
 }
 
+fn win_rect(r: Rect) -> RECT {
+    RECT { left: r.l, top: r.t, right: r.r, bottom: r.b }
+}
+
 enum Ev {
     /// Raw Input mouse: relative counts, or absolute 0..65535 coordinates.
     Mouse(i32, i32, bool),
@@ -182,7 +186,11 @@ struct App {
     rx_seq: u64,
     st: PcState,
     sw: Switch,
-    park: Option<RECT>,
+    /// While parked: our 1 px clip, and another app's confinement to restore afterwards.
+    park: Option<(RECT, Option<RECT>)>,
+    /// Edge crossing is off (fullscreen app in front or cursor confined), checked every 250 ms.
+    blocked: bool,
+    blocked_at: Instant,
     wheel_acc: [i32; 2],
     abs_prev: Option<(i32, i32)>,
     dirty: bool,
@@ -226,12 +234,21 @@ impl App {
                     self.st.x = self.st.x.wrapping_add(dx);
                     self.st.y = self.st.y.wrapping_add(dy);
                     self.dirty = true;
-                    if let Some(r) = &self.park {
+                    if let Some((r, _)) = &self.park {
                         capture::keep_parked(r);
                     }
                 } else {
+                    let r = screen();
+                    if now - self.blocked_at > Duration::from_millis(250) {
+                        self.blocked_at = now;
+                        let b = capture::edges_blocked(win_rect(r));
+                        if b != self.blocked {
+                            log!("edge crossing {}", if b { "off: fullscreen app or confined cursor" } else { "on" });
+                            (self.blocked, self.tip_at) = (b, now);
+                        }
+                    }
                     let (cx, cy) = capture::cursor_pos();
-                    let edge = switch::on_edge(self.sw.side, cx, cy, screen());
+                    let edge = if self.blocked { None } else { switch::on_edge(self.sw.side, cx, cy, r) };
                     let a = self.sw.motion(dx, dy, edge, capture::pc_button_held(), now_ms());
                     self.act(a);
                 }
@@ -283,15 +300,16 @@ impl App {
             Action::Enter(f) => {
                 (self.st.active, self.st.warp_id, self.st.warp_y) = (true, self.sw.warp_id, f);
                 capture::ACTIVE.store(true, Relaxed);
-                self.park = Some(capture::park(self.hider));
+                let (clip, prev) = capture::park(self.hider);
+                self.park = Some((clip, Some(prev).filter(|p| *p != win_rect(screen()))));
                 self.wheel_acc = [0; 2];
                 log!("tablet has control, entry at {:.1}%", f as f32 / 655.35);
             }
             Action::Leave(to) => {
                 self.st.active = false;
                 capture::ACTIVE.store(false, Relaxed);
-                capture::unpark(self.hider, to.map(|f| switch::edge_point(self.sw.side, f, screen())));
-                self.park = None;
+                let prev = self.park.take().and_then(|p| p.1);
+                capture::unpark(self.hider, prev, to.map(|f| switch::edge_point(self.sw.side, f, screen())));
                 log!("PC has control ({})", if to.is_some() { "edge" } else { "hotkey, timeout or release" });
             }
         }
@@ -394,6 +412,7 @@ impl App {
         match self.tab {
             Some(t) if !t.screen_on => s += "\ntablet screen off: Ctrl+Alt+Space enters",
             Some(t) if self.st.active && !t.strip_visible => s += "\nedge return off here: Ctrl+Alt+Space",
+            _ if !self.st.active && self.blocked => s += "\nfullscreen app: edges off, Ctrl+Alt+Space",
             _ => {}
         }
         s
@@ -475,7 +494,7 @@ fn run(cfg: Config) {
     let now = Instant::now();
     let mut app = App {
         hwnd, hider, sock, key: None, tx_seq: 0, rx_seq: 0, st: PcState::default(),
-        sw: Switch::new(cfg.side, cfg.push_counts), park: None, wheel_acc: [0; 2], abs_prev: None,
+        sw: Switch::new(cfg.side, cfg.push_counts), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None,
         dirty: false, last_send: now, key_balance: 0, hook_seen: capture::HOOK_KEYS.load(Relaxed),
         balance_since: None, launch, launch_at: None, paused: false, tab: None, heard: None,
         samples: VecDeque::new(), adb_status: "starting".into(), tip_at: now, stats_at: now, quit: false,
@@ -496,7 +515,7 @@ fn run(cfg: Config) {
         unsafe { MsgWaitForMultipleObjects(None, false, ms, QS_ALLINPUT) };
     }
     tray::remove(hwnd);
-    capture::unpark(hider, None);
+    capture::unpark(hider, app.park.and_then(|p| p.1), None);
     log!("quit");
 }
 

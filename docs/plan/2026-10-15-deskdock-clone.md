@@ -44,6 +44,10 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
 18. Where Android hides app overlays (lock screen, notification shade, Settings/permission/installer
     screens), edge return does not work; return with the hotkey. Tray shows a hint. A `dumpsys input`
     fallback is deferred.
+19. (2026-10-15, after M5, recommended by the agent in answer to the user's question) No edge
+    crossing while a fullscreen app is in front (`SHQueryUserNotificationState` = QUNS_BUSY or
+    QUNS_RUNNING_D3D_FULL_SCREEN) or while another app confines the cursor (`GetClipCursor` smaller
+    than the screen); the hotkey still crosses. Returning restores that app's cursor clip.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -276,3 +280,22 @@ under "Open checks".
 3. Lock screen / shade / Settings on the tablet: return only via the hotkey; rotate the tablet.
 4. Reboot the tablet, plug USB: it reconnects by itself; `adb kill-server` leaves the server running.
 5. `wadisplay.exe --bench 600` and a 10-minute key-mash for the M5 acceptance numbers.
+
+### After M5: fullscreen apps, edge side (2026-10-15)
+- Question from the user: should crossing work while a fullscreen app (e.g. a game) runs?
+- Rationale for decision 19: (1) mouse moves are not swallowed (Raw Input supplies the counts), so a
+  game reading Raw Input keeps turning its camera while the tablet has control; (2) RTS games scroll
+  by pushing against the screen edge, which would cross by accident; (3) the topmost cursor-hider
+  window can knock an exclusive-fullscreen game out of exclusive mode; (4) games confine the cursor
+  with ClipCursor, which parking would overwrite. A fullscreen video is blocked too (the rule cannot
+  tell it from a game); the hotkey covers that.
+- Decisions: the check runs at most every 250 ms while the PC has control (`capture::edges_blocked`);
+  the tray tooltip says "fullscreen app: edges off, Ctrl+Alt+Space"; the log records each change.
+  `park` returns the clip it replaced and `unpark` restores it (only when it was smaller than the
+  screen).
+- Edge side: already configurable with `side=left|right|top|bottom` in `wadisplay.ini` (restart the
+  exe). `side=left` on the device: the strip sits on the tablet's right edge; entry at 50% and the
+  return push out of the right edge gave `return_y` 0.4998. The run was cut short when the user's own
+  wadisplay.exe launched its server (server launches replace each other).
+- Verification: `cargo.exe check` and `cargo.exe test -p wadisplay-pc` (6) pass. Not yet run on the
+  PC with a fullscreen game: Open check.

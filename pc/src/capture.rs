@@ -14,6 +14,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, 
 use windows::Win32::UI::Input::{GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
                                 MOUSE_MOVE_ABSOLUTE, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD,
                                 RIM_TYPEMOUSE};
+use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use wadisplay_pc::keymap;
@@ -231,17 +232,30 @@ pub fn cursor_pos() -> (i32, i32) {
     (p.x, p.y)
 }
 
-/// Pins the cursor where it is and hides it. Returns the clip rect to keep enforcing.
-pub fn park(hider: HWND) -> RECT {
+/// A fullscreen app (game, video) is in front, or another app confines the cursor (games do).
+/// Crossing by edge would take the cursor from it; games reading Raw Input would still see
+/// the motion, since moves are not swallowed. The hotkey still crosses.
+pub fn edges_blocked(screen: RECT) -> bool {
+    let fullscreen = unsafe { SHQueryUserNotificationState() }
+        .is_ok_and(|s| s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN);
+    let mut clip = RECT::default();
+    fullscreen || unsafe { GetClipCursor(&mut clip) }.is_ok() && clip != screen
+}
+
+/// Pins the cursor where it is and hides it. Returns the clip rect to keep enforcing and
+/// the clip it replaced.
+pub fn park(hider: HWND) -> (RECT, RECT) {
     let (x, y) = cursor_pos();
     let r = RECT { left: x, top: y, right: x + 1, bottom: y + 1 };
+    let mut prev = RECT::default();
     unsafe {
+        let _ = GetClipCursor(&mut prev);
         let _ = ClipCursor(Some(&r));
         let _ = SetWindowPos(hider, Some(HWND_TOPMOST), x - 32, y - 32, 64, 64,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let _ = SetCursorPos(x, y); // makes Windows ask the hider for the cursor now
     }
-    r
+    (r, prev)
 }
 
 /// Re-applies the clip when something else (focus changes, other apps) replaced it.
@@ -254,9 +268,10 @@ pub fn keep_parked(r: &RECT) {
     }
 }
 
-pub fn unpark(hider: HWND, to: Option<(i32, i32)>) {
+/// `clip`: the confinement another app had set before `park`, to restore.
+pub fn unpark(hider: HWND, clip: Option<RECT>, to: Option<(i32, i32)>) {
     unsafe {
-        let _ = ClipCursor(None);
+        let _ = ClipCursor(clip.as_ref().map(|c| c as *const RECT));
         let _ = ShowWindow(hider, SW_HIDE);
         if let Some((x, y)) = to {
             let _ = SetCursorPos(x, y);
