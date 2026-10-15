@@ -25,6 +25,12 @@ cargo.exe build --release -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 The exe is `C:\wadisplay-target\release\wadisplay.exe`. Always pass `--target-dir` on C: to `cargo.exe`
 (builds on `\\wsl.localhost` are slow and `mt.exe` cannot read UNC paths).
 
+CI: `.github/workflows/build.yml` runs the same build on GitHub (job `android` on Linux: server + APK,
+artifact `android`; job `windows`: the exe, artifact `wadisplay-exe`). It links the server with the
+NDK's `aarch64-linux-android21-clang` instead of cargo-ndk (byte-identical output); keep the NDK
+version in both places in step. Actions are pinned to full commit SHAs of releases at least 14 days
+old; bump them the same way.
+
 After editing `pc/icon/*.svg` or `*.css`, re-render the committed PNGs (`online.css`/`offline.css`
 make the tray state variants; the Android vectors in `android/app/src/main/res/drawable/` repeat the
 same paths by hand):

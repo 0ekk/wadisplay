@@ -1,0 +1,62 @@
+# Builds what AGENTS.md builds by hand: the Android server and APK on Linux, then wadisplay.exe
+# (which embeds both) on Windows. Actions are pinned to commit SHAs; see docs/plan.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install NDK and Rust target
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;29.0.14206865" > /dev/null
+          rustup target add aarch64-linux-android
+      - name: Build wadisplay-server
+        # The cargo-ndk equivalent of the local build: NDK r29 clang, API 21 (cargo-ndk's default).
+        run: |
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          cargo build --release --locked -p wadisplay-server --target aarch64-linux-android
+      - name: Build APK
+        run: |
+          echo "2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046  android/gradle/wrapper/gradle-wrapper.jar" | sha256sum -c
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          cd android && ./gradlew --no-daemon -q assembleDebug
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android
+          path: |
+            target/aarch64-linux-android/release/wadisplay-server
+            android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  windows:
+    needs: android
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Restores both files at the paths pc/src/adb.rs embeds with include_bytes!.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: android
+      - name: Build wadisplay.exe
+        run: cargo build --release --locked -p wadisplay-pc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wadisplay-exe
+          path: target/release/wadisplay.exe
+          if-no-files-found: error

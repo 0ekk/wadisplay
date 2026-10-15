@@ -59,6 +59,7 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
 22. (2026-10-16, user request) The tray icon shows the state: pointer on the tablet = the tablet has
     control (the exe icon); no pointer = tablet online, the PC has control; no pointer and a dark
     tablet screen = no tablet (connecting, silent for 3 s, or disconnected).
+23. (2026-10-16, user request) A GitHub Actions workflow builds the exe and the APK.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -418,3 +419,33 @@ under "Open checks".
   "Edge strip" notification category (untested on HarmonyOS: may trade it for a system "running in
   background" notice or a frozen app), and a server-only design without the APK.
 - Impact: none on code.
+
+### GitHub Actions build (2026-10-16, decision 23)
+- Rationale: the build needed this WSL + Windows machine; CI rebuilds both deliverables from a clean
+  checkout and catches a broken build before it reaches the tablet.
+- Decisions:
+  - `.github/workflows/build.yml`, on push to `main`, pull requests and manual runs. Two jobs mirror
+    the local order: `android` (ubuntu-24.04) builds `wadisplay-server` and the debug APK and uploads
+    both as artifact `android`; `windows` (windows-2025) downloads it to the paths `adb.rs` embeds
+    and builds `wadisplay.exe` (artifact `wadisplay-exe`). Runner images are pinned by version, not
+    `-latest`.
+  - Toolchains from the runner images: rustup stable, Android SDK, `JAVA_HOME_17_X64`. NDK
+    `29.0.14206865` is installed with `sdkmanager` to match the local one. The server is linked with
+    the NDK's `aarch64-linux-android21-clang` (API 21 is cargo-ndk's default, read from the local
+    binary's `.note.android.ident`), so CI does not compile cargo-ndk from crates.io.
+  - Supply chain: `permissions: contents: read`; `persist-credentials: false`; `--locked` for cargo;
+    actions pinned to full commit SHAs, using the newest release that is at least 14 days old
+    (`checkout` v7.0.1, `upload-artifact` v7.0.1, `download-artifact` v8.0.1; the newer v7.0.2/v8.0.2
+    are 9 days old and only change retries). The committed `gradle-wrapper.jar` is checked against
+    Gradle's published SHA-256 in CI, and `gradle-wrapper.properties` now pins
+    `distributionSha256Sum` for gradle-8.11.1-bin.zip (also applies to local downloads).
+  - No caches, no release publishing, no tests in CI (the user asked for builds); add when wanted.
+  - The CI APK is signed with the runner's throwaway debug key. Deploying it over a locally built
+    APK makes `install -r` fail on the signature; `adb.rs` already falls back to uninstall + install.
+- Impact: new `.github/workflows/build.yml`; one line in `gradle-wrapper.properties`; nothing else
+  changes for local builds.
+- Verification: `actionlint` 1.7.12 (release checksum verified) reports no problems. Locally, the
+  `android` job's server step (linker env, `--locked`) produced a binary byte-identical to the
+  cargo-ndk build; the wrapper with an empty `GRADLE_USER_HOME` downloaded 8.11.1 and accepted the
+  pinned checksum; the local wrapper jar matches Gradle's published hash; `cargo.exe build --release
+  --locked -p wadisplay-pc` builds without warnings. Not run on GitHub yet: the repo has no remote.
