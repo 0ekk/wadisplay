@@ -70,6 +70,9 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
 26. (2026-10-16, user request) A tray toggle, "Keep private clipboard text on this PC" (checked by
     default), decides whether text marked private by its app (password managers) is shared too.
     Saved as `private_clipboard=keep|share` in `wadisplay.ini`.
+27. (2026-10-16, user request) The shared clipboard carries images too, both ways, under the same
+    rules as text (follows the pointer, private marker respected): PNG on the wire from the PC, PNG
+    or JPEG from the tablet.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -80,8 +83,9 @@ PC (wadisplay.exe, elevated)                   Tablet
  main thread: Raw Input, ClipCursor, tray <---> 0.0.0.0:27183  -> /dev/uhid (mouse, keyboard)
  adb thread: connect / re-arm / deploy          127.0.0.1:27184 <- companion app (EdgeService)
                                                                    1px overlay strip on return edge
- clip thread: clipboard text              TCP   0.0.0.0:27185  <-> clipboard helper (Clip.kt via
+ clip thread: clipboard text, images      TCP   0.0.0.0:27185  <-> clipboard helper (Clip.kt via
                                          <--->                      app_process, shell uid; pipes)
+                                                                   ClipProvider serves PC images
 ```
 
 ### Wire format (`proto` crate, hand-written little-endian, no serde)
@@ -148,16 +152,18 @@ PC (wadisplay.exe, elevated)                   Tablet
 - `MainActivity`: connection status + an `EditText` used as the typing test field.
 - `Clip` (not an Android component): the clipboard helper the server runs from this APK with
   `app_process` as the shell user (decision 25).
+- `ClipProvider`: exported content provider, `android:permission="android.permission.DUMP"`,
+  `grantUriPermissions`; holds the PC's latest clipboard image (decision 27).
 
 ## Repo layout (new files)
 - `Cargo.toml` (workspace), `proto/src/lib.rs`
 - `pc/src/main.rs`, `pc/src/capture.rs` (hooks, raw input, clip), `pc/src/switch.rs` (pure crossing
   state machine), `pc/src/keymap.rs` (scancode -> HID usage), `pc/src/adb.rs`, `pc/src/tray.rs`,
-  `pc/src/clip.rs` (clipboard sync),
+  `pc/src/clip.rs` (clipboard sync), `pc/src/image.rs` (WIC image conversions, in the lib),
   `pc/wadisplay.exe.manifest` (requireAdministrator, PerMonitorV2 DPI), `pc/icon/` (icon sources + PNGs)
 - `server/src/main.rs`, `server/src/uhid.rs`, `server/src/warp.rs`
 - `android/` (Gradle wrapper, `app/src/main/AndroidManifest.xml`, `EdgeService.kt`, `MainActivity.kt`,
-  `Clip.kt`, `res/` launcher and notification icons)
+  `Clip.kt`, `ClipProvider.kt`, `res/` launcher and notification icons)
 - `AGENTS.md` (build/test/deploy commands), `docs/plan/2026-10-15-deskdock-clone.md` (this design +
   per-milestone rationale/decisions/impact/verification)
 - Crates: `windows`, `chacha20poly1305`, `getrandom`, `libc`. Nothing else without asking.
@@ -531,7 +537,7 @@ under "Open checks".
     unchecks "Keep private clipboard text on this PC" (decision 26). Logs show sizes, never content.
   - The server writes tablet text to the PC with a blocking write (2 s timeout) from its input
     loop; that only happens right after the PC took control (`ponytail:` note in the code).
-  - Not done: images and files; a tray switch to turn sharing off; hiding the toast (the
+  - Not done: images (done later: decision 27) and files; a tray switch to turn sharing off; hiding the toast (the
     `clipboard_show_access_notifications` setting would hide it for every app).
 - Impact: new TCP port on the tablet, a second shell process (`app_process`) while the server
   runs, `Clip.kt` in the APK, `pc/src/clip.rs`, windows features `Win32_System_DataExchange`,
@@ -577,3 +583,58 @@ under "Open checks".
   `cargo.exe test -p wadisplay-pc` (7, incl. `set_ini_key`) pass. Open check, with the clipboard
   checks: copy from a password manager, cross with the item checked (tablet clipboard unchanged)
   and unchecked (tablet gets it); the ini line follows the menu.
+
+### Clipboard images (2026-10-16, decision 27)
+- Rationale: after text, a screenshot copied on the PC and pasted on the tablet (and the reverse)
+  was the next thing the user wanted from the shared clipboard.
+- Findings (tablet): an Android image clip is a `content://` URI plus a MIME type; the pasting app
+  reads it through the provider, with a read grant the clipboard hands it. Shell cannot share a
+  file with an app through `/sdcard/Android/data/<pkg>` (a directory shell creates there is
+  unreadable to the app), and `mkfifo` in `/data/local/tmp` is denied. `content write` / `content
+  read` (both on this build) stream a provider's file through shell. A shell `setPrimaryClip` with a
+  URI of a provider that shell may read (`android:permission` DUMP) and that allows grants is
+  accepted, and `UriGrantsManagerService` then grants each reader (logged for the IME, the
+  distributed pasteboard and the pasting app). `app_process` closes the binder driver as soon as
+  `main` returns, so pending work must finish first. Windows `adb.exe` reads stdin in text mode
+  (byte 0x1A ends it), so tests feed binary frames from files on the tablet.
+- Decisions:
+  - A clip on the wire (and between the server and the helper) is a kind byte and its data:
+    `CLIP_TEXT` 'T' + UTF-8, `CLIP_IMAGE` 'I' + an image file. `MAX_TEXT` stays 1 MiB,
+    `MAX_IMAGE` = 32 MiB; `proto::clip_ok` checks kind and size on every hop, `clip_desc` gives
+    "N bytes of text/an image" for logs (never content). The server forwards valid clips verbatim
+    and writes to the PC on a writer thread per connection, so a large image never stalls the input
+    loop; its pipe write to the helper stays in the loop (`ponytail:` note: the helper reads stdin
+    continuously, tens of ms for 32 MiB).
+  - PC -> tablet: text wins when the clipboard has both; else the "PNG" format as is, else
+    `CF_BITMAP` copied with WIC (`CreateBitmapFromHBITMAP`, alpha ignored: clipboard bitmaps rarely
+    carry real alpha) and encoded as 24-bit PNG after the clipboard is closed. The helper stores it
+    with `content write` into `ClipProvider` under a new name `wadisplay-<ms>.png` (so an app that
+    caches by URI never shows an old copy; the provider keeps only the newest file, in the app's
+    cache dir), then sets a clip with that URI and MIME `image/png`.
+  - Tablet -> PC: an item with no text, a URI not of `ClipProvider` and an `image/*` MIME type is
+    read with `content read` (the clipboard granted shell the URI when the helper read the clip);
+    PNG and JPEG pass as is, other formats are decoded with `BitmapFactory` and sent as PNG. The PC
+    decodes it with WIC on the reader thread (refusing more than 2^25 pixels), and the main thread
+    only copies it into `CF_DIB` (BITMAPINFOHEADER, 32-bit, bottom-up), plus "PNG" when the file is
+    a PNG.
+  - The PC now tracks the clipboard sequence number of the last sync (`clip::Last` is an
+    `AtomicU32`) instead of the last text: no image is read or encoded on a crossing unless the
+    clipboard changed. The helper keeps its last text or image URI in one `last`.
+  - The helper handles frames on one worker thread (order kept, stdin read on), and logs the
+    cause of reflection errors.
+  - PC writes go out in 64 KiB pieces so the 2 s write timeout means "no progress".
+- Impact: wire format change between the PC and the server (they always ship together: the exe
+  embeds the server); new exported provider in the APK; windows features `Win32_Graphics_Imaging`,
+  `Win32_System_Com`, `Win32_System_Com_StructuredStorage`; `pc/src/image.rs` in the lib.
+  Only apps that accept pasted images can use them: Huawei Notes asks the provider only whether the
+  clip can be read as text (`getStreamTypes text/*`) and pastes nothing.
+- Verification: proto `clip_kinds_and_limits`; PC `image::bitmap_to_png_to_dib` (a GDI bitmap
+  through PNG back to a DIB, pixel order and opacity; garbage refused); `cargo test` (proto 5,
+  server 10), `cargo.exe test -p wadisplay-pc` (8) and release builds pass without warnings. On the
+  tablet, with the user's clip held and restored, the helper from the installed APK: a PC PNG ends
+  up on the clipboard as a `ClipProvider` URI with `image/png`, and reading the URI returns the same
+  bytes; that image is not reported back on 'G'; the provider keeps only the newest file; a BMP
+  read through the helper's `image()` comes out as a PNG of the right size; text still sets; the
+  helper exits on EOF. User test with the real exe: screenshots pasted into a chat app on the
+  tablet, and an image copied on the tablet pasted on the PC; the logs show 3 KB to 70 KB images
+  both ways.

@@ -10,12 +10,13 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
   NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts and the clipboard relay
   (TCP to the PC, pipes to the helper) (`main.rs`).
 - `pc/`: `wadisplay.exe` (Windows, elevated via manifest). Hooks/Raw Input/cursor parking (`capture.rs`),
-  adb deploy/launch (`adb.rs`), tray (`tray.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`) is the lib, so
+  adb deploy/launch (`adb.rs`), tray (`tray.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`) and the
+  WIC image conversions (`image.rs`) are the lib, so
   tests never link the requireAdministrator manifest. `build.rs` links the manifest and `icon/*.png`
   (as a hand-written `.res`) into the exe.
 - `android/`: companion APK `com.wadisplay.companion` (`EdgeService` overlay strip, `MainActivity`
   status + typing test field, `Clip` clipboard helper that the server runs with `app_process` as
-  shell). No AndroidX.
+  shell, `ClipProvider` serving the PC's clipboard image). No AndroidX.
 
 ## Build (in WSL; order matters, the exe embeds the server binary and the APK)
 ```sh
@@ -49,6 +50,8 @@ cd pc/icon && rsvg-convert -w 16 -h 16 wadisplay-16.svg -o 16.png &&
 cargo test                                                    # proto + server (WSL)
 cargo.exe test -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 ```
+Binary data for a process on the tablet goes in a file pushed there (redirect on the tablet):
+Windows `adb.exe` reads stdin in text mode (byte 0x1A ends it) and turns LF into CRLF on stdout.
 
 ## Run
 - Start `wadisplay.exe` (UAC prompt every start). Settings and log live in `%LOCALAPPDATA%\wadisplay\`

@@ -1,15 +1,24 @@
 package com.wadisplay.companion
 
 import android.content.ClipData
+import android.content.ClipDescription
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
+import java.io.File
 import java.io.FileDescriptor
 import java.io.FileOutputStream
+import java.lang.reflect.InvocationTargetException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Clipboard helper, run by wadisplay-server as the adb shell user:
@@ -17,17 +26,22 @@ import java.nio.ByteOrder
  * READ_CLIPBOARD_IN_BACKGROUND; apps, including EdgeService, cannot read the clipboard from the
  * background. Talks to the hidden IClipboard service directly.
  *
- * Frames on stdin/stdout: u32 little-endian length, a type byte, UTF-8 text.
- * In: 'G' = report the clip if it changed since the last report, 'S' + text = set the clip.
- * Out: 'T' + text. Exits when stdin closes.
+ * Frames on stdin/stdout: u32 little-endian length, then the bytes. In: 'G' = report the clip if
+ * it changed since the last report, or a clip to set. A clip is 'T' + UTF-8 text or 'I' + an image
+ * file (PNG from the PC; PNG or JPEG from here). Out: clips. Exits when stdin closes.
+ * Images on the tablet go through ClipProvider, written with `content write`; images from other
+ * apps are read with `content read`, which works once the clipboard granted shell the URI.
  */
 object Clip {
     private const val PKG = "com.android.shell"
-    private const val MAX = 1 shl 20 // proto::MAX_CLIP
+    private const val MAX_TEXT = 1 shl 20 // proto::MAX_TEXT
+    private const val MAX_IMAGE = 32 shl 20 // proto::MAX_IMAGE
+    private const val CONTENT = "/system/bin/content"
 
     @Volatile private var changed = false
-    /** The text last reported or set; reading a clip shell set itself shows no access toast. */
-    private var last: String? = null
+    /** The text or image URI last reported or set; reading a clip shell set itself shows no toast. */
+    private var last: Any? = null
+    private val out = FileOutputStream(FileDescriptor.out)
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -47,39 +61,99 @@ object Clip {
         call(cb, "addPrimaryClipChangedListener", li)
         System.err.println("clip helper ready")
 
+        // One worker keeps sets and reports in order while stdin is read on, so the server's
+        // writes never wait for an image to be stored.
+        val work = Executors.newSingleThreadExecutor()
         val input = DataInputStream(System.`in`.buffered())
-        val out = FileOutputStream(FileDescriptor.out)
         while (true) {
             val b = try {
                 ByteArray(Integer.reverseBytes(input.readInt())).also { input.readFully(it) }
             } catch (e: EOFException) {
+                // Finish first: app_process closes the binder driver as soon as main returns.
+                work.shutdown()
+                work.awaitTermination(1, TimeUnit.MINUTES)
                 return
             }
-            try {
-                when (b.firstOrNull()) {
-                    'G'.code.toByte() -> if (changed) {
-                        changed = false // before reading: a change during the read is caught next time
-                        val clip = call(cb, "getPrimaryClip", null) as ClipData?
-                        val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()
-                        val bytes = text?.toByteArray() ?: ByteArray(0)
-                        if (text != null && text != last && bytes.size <= MAX) {
-                            last = text
-                            val f = ByteBuffer.allocate(5 + bytes.size).order(ByteOrder.LITTLE_ENDIAN)
-                                .putInt(1 + bytes.size).put('T'.code.toByte()).put(bytes)
-                            out.write(f.array())
-                            out.flush()
+            work.execute {
+                try {
+                    when (b.firstOrNull()) {
+                        'G'.code.toByte() -> if (changed) {
+                            changed = false // before reading: a change during the read is caught next time
+                            report(cb)
                         }
+                        'T'.code.toByte() -> {
+                            val text = String(b, 1, b.size - 1)
+                            last = text
+                            call(cb, "setPrimaryClip", ClipData.newPlainText("wadisplay", text))
+                        }
+                        'I'.code.toByte() -> setImage(cb, b)
                     }
-                    'S'.code.toByte() -> {
-                        val text = String(b, 1, b.size - 1)
-                        last = text
-                        call(cb, "setPrimaryClip", ClipData.newPlainText("wadisplay", text))
-                    }
+                } catch (e: Exception) {
+                    System.err.println("clip helper: ${(e as? InvocationTargetException)?.targetException ?: e}")
                 }
-            } catch (e: Exception) {
-                System.err.println("clip helper: $e")
             }
         }
+    }
+
+    private fun report(cb: Any) {
+        val clip = call(cb, "getPrimaryClip", null) as ClipData? ?: return
+        val item = clip.takeIf { it.itemCount > 0 }?.getItemAt(0) ?: return
+        val text = item.text?.toString()
+        val uri = item.uri
+        if (text != null) {
+            val bytes = text.toByteArray()
+            if (text != last && bytes.size <= MAX_TEXT) {
+                last = text
+                send('T', bytes)
+            }
+        } else if (uri != null && uri != last && uri.authority != ClipProvider.AUTHORITY &&
+            clip.description.hasMimeType("image/*")) {
+            last = uri
+            image(uri)?.let { send('I', it) }
+        }
+    }
+
+    private fun send(kind: Char, data: ByteArray) {
+        val f = ByteBuffer.allocate(5 + data.size).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(1 + data.size).put(kind.code.toByte()).put(data)
+        out.write(f.array())
+        out.flush()
+    }
+
+    /** Stores the PC's PNG in ClipProvider under a new name (so no app shows an old copy) and puts it
+     *  on the clipboard. */
+    private fun setImage(cb: Any, b: ByteArray) {
+        val uri = Uri.parse("content://${ClipProvider.AUTHORITY}/wadisplay-${System.currentTimeMillis()}.png")
+        val p = ProcessBuilder(CONTENT, "write", "--uri", "$uri")
+            .redirectOutput(File("/dev/null")).redirectError(ProcessBuilder.Redirect.INHERIT).start()
+        p.outputStream.use { it.write(b, 1, b.size - 1) }
+        if (p.waitFor() != 0) return System.err.println("clip helper: content write exited ${p.exitValue()}")
+        last = uri
+        call(cb, "setPrimaryClip", ClipData(ClipDescription("wadisplay", arrayOf("image/png")), ClipData.Item(uri)))
+    }
+
+    /** Another app's clipboard image: PNG or JPEG as is, other formats as PNG; null if unreadable. */
+    private fun image(uri: Uri): ByteArray? {
+        val p = ProcessBuilder(CONTENT, "read", "--uri", "$uri")
+            .redirectError(ProcessBuilder.Redirect.INHERIT).start()
+        val buf = ByteArrayOutputStream()
+        p.inputStream.use { s ->
+            val chunk = ByteArray(64 shl 10)
+            while (buf.size() <= MAX_IMAGE) {
+                val n = s.read(chunk)
+                if (n < 0) break
+                buf.write(chunk, 0, n)
+            }
+        }
+        p.destroy()
+        val b = buf.toByteArray()
+        val png = b.size > 4 && b[0] == 0x89.toByte() && b[1] == 'P'.code.toByte()
+        val jpeg = b.size > 3 && b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte()
+        if (b.isEmpty() || b.size > MAX_IMAGE) return null.also { System.err.println("clip helper: image of ${b.size} bytes skipped") }
+        if (png || jpeg) return b
+        val bmp = BitmapFactory.decodeByteArray(b, 0, b.size) ?: return null
+        return ByteArrayOutputStream().also { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+            .takeIf { it.size <= MAX_IMAGE }
     }
 
     /** Calls an IClipboard method whose parameters vary by Android version: the first String is the

@@ -1,40 +1,51 @@
 //! Clipboard sync. The clipboard follows the pointer: when the tablet takes control this PC's
-//! text goes to the tablet if it changed since the last sync; when the PC takes control back,
-//! the server sends the tablet's new text. Frames sealed with the session key, over TCP.
+//! text or image goes to the tablet if the clipboard changed since the last sync; when the PC
+//! takes control back, the server sends the tablet's new clip. Frames sealed with the session
+//! key, over TCP.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use wadisplay_pc::image;
 use wadisplay_proto as proto;
 use windows::core::w;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData,
-                                           IsClipboardFormatAvailable, OpenClipboard,
-                                           RegisterClipboardFormatW, SetClipboardData};
+                                           GetClipboardSequenceNumber, IsClipboardFormatAvailable,
+                                           OpenClipboard, RegisterClipboardFormatW, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_UNICODETEXT};
 
 use crate::log;
 
 pub enum Cmd {
     /// A new server runs with this key: reconnect.
     Key([u8; 32]),
-    /// The tablet took control: send this PC's text if it changed.
+    /// The tablet took control: send this PC's clip if the clipboard changed.
     Enter,
-    /// Whether text marked private (password managers) is shared too.
+    /// Whether clips marked private (password managers) are shared too.
     SharePrivate(bool),
 }
 
-/// The text last synced either way, in PC form (CRLF line ends).
-pub type Last = Arc<Mutex<Option<String>>>;
+/// A clip from the tablet, ready for this PC's clipboard.
+pub enum Clip {
+    /// CRLF line ends.
+    Text(String),
+    /// CF_DIB, plus the file as "PNG" when it is one.
+    Image { dib: Vec<u8>, png: Option<Vec<u8>> },
+}
 
-/// Owns the connection. Tablet text arrives through `emit`, from a reader thread.
+/// The clipboard sequence number at the last sync either way.
+pub type Last = Arc<AtomicU32>;
+
+/// Owns the connection. Tablet clips arrive through `emit`, from a reader thread.
 pub fn thread(ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool,
-              emit: impl Fn(String) + Send + Clone + 'static) {
+              emit: impl Fn(Clip) + Send + Clone + 'static) {
     let mut key: Option<([u8; 32], Arc<AtomicU64>)> = None;
     let mut conn: Option<TcpStream> = None;
     let mut tx_seq = 0;
@@ -48,11 +59,14 @@ pub fn thread(ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool
             Cmd::SharePrivate(v) => share_private = v,
             Cmd::Enter => {
                 let Some(k) = &key else { continue };
-                let Some(text) = get(share_private).filter(|t| Some(t) != last.lock().unwrap().as_ref()) else { continue };
-                let lf = text.replace("\r\n", "\n");
-                *last.lock().unwrap() = Some(text);
-                if lf.len() > proto::MAX_CLIP {
-                    log!("clipboard: {} bytes, too large to share", lf.len());
+                let seq = unsafe { GetClipboardSequenceNumber() };
+                if seq == last.load(Relaxed) {
+                    continue;
+                }
+                let Some(c) = get(share_private) else { continue };
+                last.store(seq, Relaxed);
+                if !proto::clip_ok(&c) {
+                    log!("clipboard: {}, too large to share", proto::clip_desc(&c));
                     continue;
                 }
                 // A connection that died quietly fails on write: reconnect and send once more.
@@ -60,11 +74,13 @@ pub fn thread(ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool
                     if conn.is_none() {
                         conn = connect(&ip, k, emit.clone());
                     }
-                    let Some(c) = &mut conn else { break };
-                    tx_seq += 1;
-                    match c.write_all(&proto::frame(&proto::seal_bytes(&k.0, proto::DIR_PC_CLIP, tx_seq, lf.as_bytes()))) {
+                    let Some(s) = &mut conn else { break };
+                    tx_seq += 1; // spent even if the write fails: a nonce is never reused
+                    let f = proto::frame(&proto::seal_bytes(&k.0, proto::DIR_PC_CLIP, tx_seq, &c));
+                    // In pieces, so the 2 s write timeout means "no progress", not "all of an image".
+                    match f.chunks(64 << 10).try_for_each(|p| s.write_all(p)) {
                         Ok(()) => {
-                            log!("clipboard: {} bytes to the tablet", lf.len());
+                            log!("clipboard: {} to the tablet", proto::clip_desc(&c));
                             break;
                         }
                         Err(e) => {
@@ -84,7 +100,7 @@ fn close(conn: &mut Option<TcpStream>) {
     }
 }
 
-fn connect(ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(String) + Send + 'static)
+fn connect(ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(Clip) + Send + 'static)
            -> Option<TcpStream> {
     let addr = (ip, proto::CLIP_PORT).to_socket_addrs().ok()?.next()?;
     let c = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
@@ -97,17 +113,30 @@ fn connect(ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(S
         let mut len = [0; 4];
         while r.read_exact(&mut len).is_ok() {
             let n = u32::from_le_bytes(len) as usize;
+            if n > proto::MAX_SEALED {
+                break;
+            }
             let mut b = vec![0; n];
-            if n > proto::MAX_SEALED || r.read_exact(&mut b).is_err() {
+            if r.read_exact(&mut b).is_err() {
                 break;
             }
             let mut seq = rx_seq.load(Relaxed);
-            match proto::open_bytes(&key, proto::DIR_TAB_CLIP, &b, &mut seq).map(String::from_utf8) {
-                Some(Ok(text)) => {
-                    rx_seq.store(seq, Relaxed);
-                    emit(text);
-                }
-                _ => log!("clipboard: dropped a frame that does not authenticate"),
+            let Some(c) = proto::open_bytes(&key, proto::DIR_TAB_CLIP, &b, &mut seq).filter(|c| proto::clip_ok(c)) else {
+                log!("clipboard: dropped a frame that does not authenticate");
+                continue;
+            };
+            rx_seq.store(seq, Relaxed);
+            log!("clipboard: {} from the tablet", proto::clip_desc(&c));
+            // Decoding takes a while for big images: here, not on the main thread.
+            match (c[0], c[1..].to_vec()) {
+                (proto::CLIP_TEXT, t) => match String::from_utf8(t) {
+                    Ok(t) => emit(Clip::Text(t.replace("\r\n", "\n").replace('\n', "\r\n"))),
+                    Err(_) => log!("clipboard: tablet text is not UTF-8"),
+                },
+                (_, file) => match image::dib(&file) {
+                    Ok(dib) => emit(Clip::Image { dib, png: file.starts_with(b"\x89PNG").then_some(file) }),
+                    Err(e) => log!("clipboard: tablet image: {e}"),
+                },
             }
         }
     });
@@ -136,44 +165,83 @@ fn open(owner: Option<HWND>) -> Option<Opened> {
     None
 }
 
-/// This PC's clipboard text. Unless `share_private`, None when the app that set it asked
-/// clipboard monitors to skip it (password managers do, with ExcludeClipboardContentFromMonitorProcessing).
-fn get(share_private: bool) -> Option<String> {
-    let _open = open(None)?;
-    unsafe {
-        if !share_private && IsClipboardFormatAvailable(RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"))).is_ok() {
-            return None;
-        }
-        let h = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
-        let g = windows::Win32::Foundation::HGLOBAL(h.0);
-        let p = GlobalLock(g) as *const u16;
-        if p.is_null() {
-            return None;
-        }
-        let s = std::slice::from_raw_parts(p, GlobalSize(g) / 2);
-        let text = String::from_utf16_lossy(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())]);
-        let _ = GlobalUnlock(g);
-        Some(text)
+/// The bytes of a clipboard format.
+unsafe fn data(format: u32) -> Option<Vec<u8>> {
+    let g = HGLOBAL(GetClipboardData(format).ok()?.0);
+    let p = GlobalLock(g) as *const u8;
+    if p.is_null() {
+        return None;
     }
+    let b = std::slice::from_raw_parts(p, GlobalSize(g)).to_vec();
+    let _ = GlobalUnlock(g);
+    Some(b)
 }
 
-/// Sets this PC's clipboard text. `owner` is a window of the calling thread: with none,
-/// SetClipboardData fails.
-pub fn set(owner: HWND, text: &str) {
-    let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
-    let Some(_open) = open(Some(owner)) else { return };
-    unsafe {
-        let Ok(g) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) else { return };
-        let p = GlobalLock(g) as *mut u16;
-        if p.is_null() {
-            let _ = GlobalFree(Some(g));
-            return;
+/// This PC's clip: text (LF line ends), else an image as PNG. Unless `share_private`, None when
+/// the app that set it asked clipboard monitors to skip it (password managers do, with
+/// ExcludeClipboardContentFromMonitorProcessing).
+fn get(share_private: bool) -> Option<Vec<u8>> {
+    let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+    let bitmap = {
+        let _open = open(None)?;
+        unsafe {
+            if !share_private && IsClipboardFormatAvailable(RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"))).is_ok() {
+                return None;
+            }
+            if let Some(b) = data(CF_UNICODETEXT.0 as u32) {
+                let s: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                let text = String::from_utf16_lossy(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())]);
+                return Some([&[proto::CLIP_TEXT][..], text.replace("\r\n", "\n").as_bytes()].concat());
+            }
+            // GlobalSize may round up; PNG readers stop at IEND.
+            if let Some(png) = data(png_format) {
+                return Some([&[proto::CLIP_IMAGE][..], &png].concat());
+            }
+            image::copy_hbitmap(HBITMAP(GetClipboardData(CF_BITMAP.0 as u32).ok()?.0))
+                .map_err(|e| log!("clipboard: bitmap: {e}"))
+                .ok()?
         }
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
-        let _ = GlobalUnlock(g);
-        let _ = EmptyClipboard();
-        if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(g.0))).is_err() {
-            let _ = GlobalFree(Some(g)); // the clipboard owns it only on success
+    };
+    // Encoding a big bitmap takes a while: after closing the clipboard.
+    let png = image::png(&bitmap).map_err(|e| log!("clipboard: png: {e}")).ok()?;
+    Some([&[proto::CLIP_IMAGE][..], &png].concat())
+}
+
+/// Puts a tablet clip on this PC's clipboard and records it as synced. `owner` is a window of the
+/// calling thread: with none, SetClipboardData fails.
+pub fn set(owner: HWND, c: &Clip, last: &Last) {
+    let wide;
+    let items: Vec<(u32, &[u8])> = match c {
+        Clip::Text(t) => {
+            wide = t.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+            vec![(CF_UNICODETEXT.0 as u32, &wide)]
+        }
+        Clip::Image { dib, png } => {
+            let mut v = vec![(CF_DIB.0 as u32, &dib[..])];
+            if let Some(p) = png {
+                v.push((unsafe { RegisterClipboardFormatW(w!("PNG")) }, &p[..]));
+            }
+            v
+        }
+    };
+    {
+        let Some(_open) = open(Some(owner)) else { return };
+        unsafe {
+            let _ = EmptyClipboard();
+            for (format, b) in items {
+                let Ok(g) = GlobalAlloc(GMEM_MOVEABLE, b.len()) else { continue };
+                let p = GlobalLock(g) as *mut u8;
+                if p.is_null() {
+                    let _ = GlobalFree(Some(g));
+                    continue;
+                }
+                std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());
+                let _ = GlobalUnlock(g);
+                if SetClipboardData(format, Some(HANDLE(g.0))).is_err() {
+                    let _ = GlobalFree(Some(g)); // the clipboard owns it only on success
+                }
+            }
         }
     }
+    last.store(unsafe { GetClipboardSequenceNumber() }, Relaxed);
 }

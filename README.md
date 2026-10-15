@@ -10,7 +10,7 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 ## Features
 - Edge crossing in both directions, plus a hotkey (`Ctrl+Alt+Space`) to switch at any time.
 - Keyboard follows the pointer; the tablet's input method composes Chinese and other languages.
-- Shared clipboard (text): copy on one device, move the pointer over, paste.
+- Shared clipboard (text and images): copy on one device, move the pointer over, paste.
 - Low latency: about 1.6 ms median, 2.8 ms p99 from PC input to the tablet's input device
   (measured on one home LAN, tablet on Wi-Fi, PC wired).
 - Nothing to install on the tablet by hand: the PC deploys and starts everything over adb.
@@ -44,9 +44,9 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 - Crossing is suppressed while a mouse button is held (so dragging a window to the edge for Snap
   stays on the PC), while a fullscreen app such as a game is in front, and while another app
   confines the cursor. The hotkey still works in all three cases.
-- The clipboard follows the pointer. Moving to the tablet gives it the PC's latest copied text;
-  moving back gives the PC the tablet's. Text that password managers mark as private stays on the PC
-  unless you uncheck "Keep private clipboard text on this PC" in the tray menu.
+- The clipboard follows the pointer. Moving to the tablet gives it the PC's latest copied text or
+  image; moving back gives the PC the tablet's. Text that password managers mark as private stays on
+  the PC unless you uncheck "Keep private clipboard text on this PC" in the tray menu.
   On the tablet, Android then shows "Shell read the clipboard." (once per tablet copy).
 - Tray menu: the current status, "Tablet on the left" / "Tablet on the right", "Keep private
   clipboard text on this PC", Connect/Disconnect, Quit. Hover the tray icon for latency and hints.
@@ -73,8 +73,10 @@ Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each star
 `wadisplay.exe --bench [seconds]` measures latency (default 60 s) and shows the result.
 
 ## Limitations
-- The clipboard carries text only (up to 1 MiB); no images or files, no file drag-and-drop, one
-  tablet.
+- The clipboard carries text (up to 1 MiB) and images (up to 32 MiB as a PNG or JPEG file); no
+  files, no file drag-and-drop, one tablet.
+- A pasted image needs a tablet app that accepts pasted images (chat apps such as Telegram do);
+  Huawei Notes, for one, takes only text from the clipboard.
 - Some tablet apps keep their own copy of the clipboard. Termius, for one, pastes the previous text
   for about 5 seconds after the pointer arrives; other apps get the new text at once.
 - Reading the tablet's clipboard shows Android's "Shell read the clipboard." notice each time the
@@ -97,7 +99,8 @@ Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each star
   keyboard through `/dev/uhid`, so Android treats them like plugged-in HID devices.
 - For the clipboard, the server also runs a small helper from the companion APK as the adb shell
   user, because Android lets only the focused app and the keyboard app read the clipboard; the
-  shell user is allowed to. Clipboard text travels over a separate encrypted TCP connection.
+  shell user is allowed to. Clipboard text and images travel over a separate encrypted TCP
+  connection; images from the PC are served to tablet apps by the companion app's content provider.
 - The companion app `com.wadisplay.companion` (Kotlin) runs a background service with a 1-pixel
   transparent strip on the return edge. It reports when the pointer reaches it, plus screen size,
   rotation and screen state. It keeps a silent notification because Android requires one for

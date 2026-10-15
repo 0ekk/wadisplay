@@ -148,8 +148,8 @@ enum Ev {
     Tray(u32),
     Net(Vec<u8>),
     Adb(adb::Event),
-    /// Clipboard text from the tablet.
-    Clip(String),
+    /// A clip from the tablet.
+    Clip(clip::Clip),
 }
 
 static TX: OnceLock<Sender<Ev>> = OnceLock::new();
@@ -323,12 +323,7 @@ impl App {
                 log!("{e}");
                 self.adb_status = e;
             }
-            Ev::Clip(text) => {
-                let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
-                log!("clipboard: {} bytes from the tablet", text.len());
-                clip::set(self.hwnd, &text);
-                *self.clip_last.lock().unwrap() = Some(text);
-            }
+            Ev::Clip(c) => clip::set(self.hwnd, &c, &self.clip_last),
         }
     }
 
@@ -556,7 +551,7 @@ fn run(cfg: Config) {
     let clip_last = clip::Last::default();
     let (ip, last) = (cfg.tablet_ip.clone(), clip_last.clone());
     let share_private = cfg.share_private;
-    std::thread::spawn(move || clip::thread(ip, clip_rx, last, share_private, |t| emit_wake(Ev::Clip(t))));
+    std::thread::spawn(move || clip::thread(ip, clip_rx, last, share_private, |c| emit_wake(Ev::Clip(c))));
 
     let now = Instant::now();
     let mut app = App {

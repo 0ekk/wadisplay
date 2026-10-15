@@ -7,15 +7,38 @@ use chacha20poly1305::ChaCha20Poly1305;
 pub const PORT: u16 = 27183;
 pub const DIR_PC: u8 = 0;
 pub const DIR_TAB: u8 = 1;
-/// Clipboard text travels over TCP (`CLIP_PORT`), sealed with the same key; these
-/// directions keep its nonces apart from the datagrams'.
+/// Clipboard contents travel over TCP (`CLIP_PORT`), sealed with the same key; these
+/// directions keep its nonces apart from the datagrams'. A clip is a kind byte and its data.
 pub const CLIP_PORT: u16 = 27185;
 pub const DIR_PC_CLIP: u8 = 2;
 pub const DIR_TAB_CLIP: u8 = 3;
+/// UTF-8 text, LF line ends.
+pub const CLIP_TEXT: u8 = b'T';
+/// An image file: PNG from the PC; PNG or JPEG from the tablet.
+pub const CLIP_IMAGE: u8 = b'I';
 /// Largest clipboard text, in UTF-8 bytes, that either side sends.
-pub const MAX_CLIP: usize = 1 << 20;
-/// Largest sealed clipboard frame: seq + text + tag.
+pub const MAX_TEXT: usize = 1 << 20;
+/// Largest clipboard image file.
+pub const MAX_IMAGE: usize = 32 << 20;
+/// Largest clip: kind + data.
+pub const MAX_CLIP: usize = 1 + MAX_IMAGE;
+/// Largest sealed clipboard frame: seq + clip + tag.
 pub const MAX_SEALED: usize = 8 + MAX_CLIP + 16;
+
+/// For logs: size and kind, never content.
+pub fn clip_desc(c: &[u8]) -> String {
+    let kind = if c.first() == Some(&CLIP_IMAGE) { "an image" } else { "text" };
+    format!("{} bytes of {kind}", c.len().saturating_sub(1))
+}
+
+/// A clip either side may send: a known kind within its size limit.
+pub fn clip_ok(c: &[u8]) -> bool {
+    match c.split_first() {
+        Some((&CLIP_TEXT, d)) => d.len() <= MAX_TEXT,
+        Some((&CLIP_IMAGE, d)) => !d.is_empty() && d.len() <= MAX_IMAGE,
+        _ => false,
+    }
+}
 
 /// Where the tablet sits relative to the PC monitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,6 +367,15 @@ mod tests {
         assert_eq!(open_bytes(&key, DIR_TAB_CLIP, &got[0], &mut last), None, "replay");
         assert_eq!(open_bytes(&key, DIR_TAB_CLIP, &got[1], &mut last), Some(vec![]));
         assert_eq!(Frames::default().push(&frame(&[0; 9]), 8), None, "too long");
+    }
+
+    #[test]
+    fn clip_kinds_and_limits() {
+        assert!(clip_ok(b"T") && clip_ok(b"Thi") && clip_ok(b"I\x89PNG"));
+        assert!(!clip_ok(b"") && !clip_ok(b"I") && !clip_ok(b"Xhi"), "empty, empty image, unknown kind");
+        assert!(clip_ok(&[&[CLIP_TEXT][..], &vec![b'a'; MAX_TEXT]].concat()));
+        assert!(!clip_ok(&[&[CLIP_TEXT][..], &vec![b'a'; MAX_TEXT + 1]].concat()), "text too long");
+        assert!(!clip_ok(&vec![CLIP_IMAGE; MAX_CLIP + 1]), "image too large");
     }
 
     #[test]
