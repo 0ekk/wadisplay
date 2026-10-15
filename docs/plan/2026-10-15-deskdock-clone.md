@@ -451,7 +451,11 @@ under "Open checks".
   `android` job's server step (linker env, `--locked`) produced a binary byte-identical to the
   cargo-ndk build; the wrapper with an empty `GRADLE_USER_HOME` downloaded 8.11.1 and accepted the
   pinned checksum; the local wrapper jar matches Gradle's published hash; `cargo.exe build --release
-  --locked -p wadisplay-pc` builds without warnings. Not run on GitHub yet: the repo has no remote.
+  --locked -p wadisplay-pc` builds without warnings. First GitHub run (after the push of decision 24)
+  passed: `android` 1m37s, `windows` 53s, artifacts `android` and `wadisplay-exe`. Its server binary
+  is 16 bytes longer than the local one: same rustc 1.99.0, but dependency panic messages embed the
+  `~/.cargo/registry` path, which differs per home directory. Not remapped (`--remap-path-prefix`);
+  add it if byte-identical CI and local builds are ever needed.
 
 ### Local details removed before publishing (2026-10-16, decision 24)
 - Rationale: the repo is about to go to a public GitHub repo. A scan of every added line in all
