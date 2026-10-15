@@ -40,6 +40,7 @@ pub struct Config {
 
 const DEFAULT_INI: &str = "\
 # wadisplay settings; restart wadisplay.exe after editing. The tray menu also sets side.
+# the tablet's Wi-Fi IP address (required)
 tablet_ip=
 # adb.exe path, or adb to find it on PATH
 adb=adb
@@ -623,6 +624,10 @@ fn main() {
                                       std::mem::size_of_val(&s) as u32);
     }
     let cfg = Config::load();
+    if cfg.tablet_ip.is_empty() {
+        return message_box(&format!("Set tablet_ip to the tablet's Wi-Fi IP address in\n{}\nthen start wadisplay again.",
+                                    Config::path().display()));
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.iter().position(|a| a == "--bench") {
         Some(i) => bench(&cfg, args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(60)),

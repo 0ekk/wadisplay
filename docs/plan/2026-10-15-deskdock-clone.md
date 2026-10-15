@@ -60,6 +60,9 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
     control (the exe icon); no pointer = tablet online, the PC has control; no pointer and a dark
     tablet screen = no tablet (connecting, silent for 3 s, or disconnected).
 23. (2026-10-16, user request) A GitHub Actions workflow builds the exe and the APK.
+24. (2026-10-16, user request, before the first push to a public GitHub repo) The repo carries no
+    local details: no LAN IPs, device or PC models, screen sizes or local paths in the docs, and no
+    built-in tablet IP in the code. The rewritten history is applied to every commit.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -449,3 +452,27 @@ under "Open checks".
   cargo-ndk build; the wrapper with an empty `GRADLE_USER_HOME` downloaded 8.11.1 and accepted the
   pinned checksum; the local wrapper jar matches Gradle's published hash; `cargo.exe build --release
   --locked -p wadisplay-pc` builds without warnings. Not run on GitHub yet: the repo has no remote.
+
+### Local details removed before publishing (2026-10-16, decision 24)
+- Rationale: the repo is about to go to a public GitHub repo. A scan of every added line in all
+  commits found no secrets (no keys, tokens, passwords, private keys or emails in content; no ignored
+  files ever committed; PNGs without metadata), but did find the home LAN addresses, the exact tablet
+  and PC models, screen sizes and a local path.
+- Decisions:
+  - Docs use `<tablet-ip>` / `<pc-ip>`, "a Huawei tablet, HarmonyOS 4", "Windows 11, one monitor",
+    "`[0,0][1,<screen height>]`" and "the repo". Unit-test fixtures keep their screen sizes (plain
+    numbers, needed by the tests).
+  - Code: `tablet_ip` has no default (`DEFAULT_INI` writes `tablet_ip=` with a "required" comment). If
+    it is empty, `main` shows a message box with the ini path and exits instead of panicking in
+    `UdpSocket::connect`. Existing ini files keep their IP.
+  - History: all 8 commits were rewritten with `git filter-branch --tree-filter` (the same `sed`
+    replacements in every commit) and `--commit-filter 'git commit-tree -S'`, so every commit stays
+    GPG-signed with its original author, dates and message. Nothing had been pushed: GitHub held
+    only its own `LICENSE` commit. The pre-rewrite history is kept locally under `refs/original/`
+    (not pushed by `git push` or `--all`).
+  - Commit author name and email unchanged (user choice).
+- Impact: commit ids changed; first start without `tablet_ip` asks for it.
+- Verification: in each rewritten commit only `AGENTS.md`, this file and `pc/src/main.rs` differ from
+  the original; `git log --format=%G?` is `G` for all 8; the same history scan finds none of the
+  removed strings. `cargo.exe build --release --locked -p wadisplay-pc` (no warnings) and
+  `cargo.exe test -p wadisplay-pc` (7) pass.
