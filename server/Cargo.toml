@@ -1,0 +1,8 @@
+[package]
+name = "wadisplay-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wadisplay-proto = { path = "../proto" }
+libc = "0.2"

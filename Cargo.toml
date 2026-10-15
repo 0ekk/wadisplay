@@ -1,0 +1,10 @@
+[workspace]
+members = ["proto", "pc", "server"]
+# The PC crate only builds on Windows (cargo.exe); plain `cargo` in WSL builds the rest.
+default-members = ["proto", "server"]
+resolver = "2"
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"
