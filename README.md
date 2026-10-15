@@ -10,6 +10,7 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 ## Features
 - Edge crossing in both directions, plus a hotkey (`Ctrl+Alt+Space`) to switch at any time.
 - Keyboard follows the pointer; the tablet's input method composes Chinese and other languages.
+- Shared clipboard (text): copy on one device, move the pointer over, paste.
 - Low latency: about 1.6 ms median, 2.8 ms p99 from PC input to the tablet's input device
   (measured on one home LAN, tablet on Wi-Fi, PC wired).
 - Nothing to install on the tablet by hand: the PC deploys and starts everything over adb.
@@ -43,8 +44,12 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 - Crossing is suppressed while a mouse button is held (so dragging a window to the edge for Snap
   stays on the PC), while a fullscreen app such as a game is in front, and while another app
   confines the cursor. The hotkey still works in all three cases.
-- Tray menu: the current status, "Tablet on the left" / "Tablet on the right", Connect/Disconnect,
-  Quit. Hover the tray icon for latency and hints.
+- The clipboard follows the pointer. Moving to the tablet gives it the PC's latest copied text;
+  moving back gives the PC the tablet's. Text that password managers mark as private stays on the PC
+  unless you uncheck "Keep private clipboard text on this PC" in the tray menu.
+  On the tablet, Android then shows "Shell read the clipboard." (once per tablet copy).
+- Tray menu: the current status, "Tablet on the left" / "Tablet on the right", "Keep private
+  clipboard text on this PC", Connect/Disconnect, Quit. Hover the tray icon for latency and hints.
 
 | Tray icon | Meaning |
 |---|---|
@@ -61,13 +66,20 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 | `adb` | `adb` | Path to `adb.exe`, or `adb` to find it on `PATH` |
 | `side` | `right` | Where the tablet sits next to the monitor: `left`, `right`, `top`, `bottom` (the tray menu sets left/right) |
 | `push_counts` | `20` | Raw mouse counts to push past the edge before control crosses |
+| `private_clipboard` | `keep` | Text that password managers mark private: `keep` it on the PC or `share` it (the tray menu sets this) |
 
 Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each start) and
 `/data/local/tmp/wadisplay.log` on the tablet (`adb shell cat /data/local/tmp/wadisplay.log`).
 `wadisplay.exe --bench [seconds]` measures latency (default 60 s) and shows the result.
 
 ## Limitations
-- Mouse and keyboard only: no clipboard sharing, no file drag-and-drop, one tablet.
+- The clipboard carries text only (up to 1 MiB); no images or files, no file drag-and-drop, one
+  tablet.
+- Some tablet apps keep their own copy of the clipboard. Termius, for one, pastes the previous text
+  for about 5 seconds after the pointer arrives; other apps get the new text at once.
+- Reading the tablet's clipboard shows Android's "Shell read the clipboard." notice each time the
+  pointer leaves the tablet after something new was copied there. Only the system-wide clipboard
+  privacy setting could hide it, and wadisplay leaves that alone.
 - Android hides app overlays on the lock screen, in the notification shade and on Settings,
   permission and installer screens. The edge back to the PC does not work there; use the hotkey.
 - With the tablet screen off, edges are inactive; the hotkey still enters (a key or click wakes it).
@@ -83,6 +95,9 @@ Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each star
   30 ms and on every change as encrypted UDP packets.
 - `wadisplay-server` (Rust, runs on the tablet as the adb shell user) creates a virtual mouse and
   keyboard through `/dev/uhid`, so Android treats them like plugged-in HID devices.
+- For the clipboard, the server also runs a small helper from the companion APK as the adb shell
+  user, because Android lets only the focused app and the keyboard app read the clipboard; the
+  shell user is allowed to. Clipboard text travels over a separate encrypted TCP connection.
 - The companion app `com.wadisplay.companion` (Kotlin) runs a background service with a 1-pixel
   transparent strip on the return edge. It reports when the pointer reaches it, plus screen size,
   rotation and screen state. It keeps a silent notification because Android requires one for
@@ -90,11 +105,14 @@ Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each star
 - Design notes and the reasons behind each decision: [docs/plan](docs/plan/2026-10-15-deskdock-clone.md).
 
 ## Security
-- Each server launch gets a fresh random 256-bit key, handed to it over adb (stdin); every UDP
-  packet is encrypted and authenticated with ChaCha20-Poly1305, so other hosts on the LAN cannot
-  inject input.
-- adb over Wi-Fi (port 5555) is reachable from the whole LAN while enabled. New computers still need
-  the tablet's "Allow USB debugging" approval, but use wadisplay on networks you trust.
+- Each server launch gets a fresh random 256-bit key, handed to it over adb (stdin). All input and
+  clipboard traffic is encrypted and authenticated with ChaCha20-Poly1305 under that key, so a
+  device on the LAN that did not see the key cannot read it or inject input.
+- adb over Wi-Fi (`adb tcpip`, port 5555) is not encrypted, so the key itself crosses the LAN in the
+  clear at each launch; someone able to capture your LAN traffic at that moment could read the
+  clipboard and input that follow. adb also stays reachable from the whole LAN while enabled (new
+  computers still need the tablet's "Allow USB debugging" approval). Use wadisplay on networks you
+  trust.
 
 ## Building
 The build runs in WSL (Linux) for the Android parts and with the Windows Rust toolchain (MSVC) for

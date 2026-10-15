@@ -7,13 +7,15 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
 ## Layout
 - `proto/`: wire format shared by both sides (`PcState`, `TabState`, ChaCha20-Poly1305 `seal`/`open`, `Side`).
 - `server/`: `wadisplay-server`, Rust aarch64 Android binary run as the adb shell uid. UHID mouse +
-  NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts (`main.rs`).
+  NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts and the clipboard relay
+  (TCP to the PC, pipes to the helper) (`main.rs`).
 - `pc/`: `wadisplay.exe` (Windows, elevated via manifest). Hooks/Raw Input/cursor parking (`capture.rs`),
-  adb deploy/launch (`adb.rs`), tray (`tray.rs`). Pure logic (`switch.rs`, `keymap.rs`) is the lib, so
+  adb deploy/launch (`adb.rs`), tray (`tray.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`) is the lib, so
   tests never link the requireAdministrator manifest. `build.rs` links the manifest and `icon/*.png`
   (as a hand-written `.res`) into the exe.
 - `android/`: companion APK `com.wadisplay.companion` (`EdgeService` overlay strip, `MainActivity`
-  status + typing test field). No AndroidX.
+  status + typing test field, `Clip` clipboard helper that the server runs with `app_process` as
+  shell). No AndroidX.
 
 ## Build (in WSL; order matters, the exe embeds the server binary and the APK)
 ```sh
@@ -52,7 +54,7 @@ cargo.exe test -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 - Start `wadisplay.exe` (UAC prompt every start). Settings and log live in `%LOCALAPPDATA%\wadisplay\`
   (`wadisplay.ini`, created with defaults on first start, which then asks for `tablet_ip`;
   `wadisplay.log`, rewritten each start). The tray menu
-  switches the tablet between left and right. It connects adb to `tablet_ip:5555` (running
+  switches the tablet between left and right and whether private clipboard text stays on the PC. It connects adb to `tablet_ip:5555` (running
   `adb tcpip 5555` if the tablet is on USB), deploys the server/APK when their hashes change and
   launches the server.
 - Latency bench: `wadisplay.exe --bench [seconds]` (default 60; result in a message box and the log).
@@ -60,6 +62,7 @@ cargo.exe test -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 
 ## Rules
 - The tablet may be deployed to and tested over adb at any time, but send key input only while our
-  `MainActivity` test field has focus; mouse moves are fine.
+  `MainActivity` test field has focus; mouse moves are fine. Clipboard tests must save the user's
+  clip first and restore it afterwards, and must not print it.
 - Crates: `windows`, `chacha20poly1305`, `getrandom`, `libc`. Ask before adding anything else.
 - One GPG-signed commit per milestone, on `main`.

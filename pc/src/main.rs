@@ -4,6 +4,7 @@
 
 mod adb;
 mod capture;
+mod clip;
 mod tray;
 
 use std::collections::VecDeque;
@@ -36,6 +37,8 @@ pub struct Config {
     pub adb: String,
     pub side: Side,
     pub push_counts: i32,
+    /// Share clipboard text that its app marked private (password managers); off by default.
+    pub share_private: bool,
 }
 
 const DEFAULT_INI: &str = "\
@@ -48,6 +51,8 @@ adb=adb
 side=right
 # raw mouse counts to push past the edge before control crosses over
 push_counts=20
+# clipboard text that password managers mark private: keep (on this PC) or share. The tray menu also sets it.
+private_clipboard=keep
 ";
 
 impl Config {
@@ -61,7 +66,8 @@ impl Config {
             let _ = std::fs::write(&path, DEFAULT_INI);
             DEFAULT_INI.into()
         });
-        let mut c = Config { tablet_ip: String::new(), adb: "adb".into(), side: Side::Right, push_counts: 20 };
+        let mut c = Config { tablet_ip: String::new(), adb: "adb".into(), side: Side::Right, push_counts: 20,
+                            share_private: false };
         for line in text.lines().filter(|l| !l.trim_start().starts_with(['#', ';'])) {
             let Some((k, v)) = line.split_once('=') else { continue };
             let v = v.trim();
@@ -70,19 +76,20 @@ impl Config {
                 "adb" => c.adb = v.into(),
                 "side" => c.side = Side::parse(v).unwrap_or(c.side),
                 "push_counts" => c.push_counts = v.parse().unwrap_or(c.push_counts),
+                "private_clipboard" => c.share_private = v == "share",
                 k => log!("wadisplay.ini: unknown key {k}"),
             }
         }
-        log!("config {}: tablet {} side {} push {} adb {}", path.display(), c.tablet_ip, c.side.name(),
-             c.push_counts, c.adb);
+        log!("config {}: tablet {} side {} push {} adb {} private clipboard {}", path.display(), c.tablet_ip,
+             c.side.name(), c.push_counts, c.adb, if c.share_private { "share" } else { "keep" });
         c
     }
 
-    /// Rewrites the `side=` line in place.
-    fn save_side(side: Side) {
+    /// Rewrites one `key=` line in place.
+    fn save(key: &str, value: &str) {
         let path = Config::path();
         let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_INI.into());
-        if let Err(e) = std::fs::write(&path, wadisplay_pc::set_ini_key(&text, "side", side.name())) {
+        if let Err(e) = std::fs::write(&path, wadisplay_pc::set_ini_key(&text, key, value)) {
             log!("{}: {e}", path.display());
         }
     }
@@ -141,6 +148,8 @@ enum Ev {
     Tray(u32),
     Net(Vec<u8>),
     Adb(adb::Event),
+    /// Clipboard text from the tablet.
+    Clip(String),
 }
 
 static TX: OnceLock<Sender<Ev>> = OnceLock::new();
@@ -221,6 +230,8 @@ struct App {
     balance_since: Option<Instant>,
     launch: Sender<Config>,
     launch_at: Option<Instant>,
+    clip: Sender<clip::Cmd>,
+    clip_last: clip::Last,
     paused: bool,
     tab: Option<TabState>,
     heard: Option<Instant>,
@@ -305,11 +316,18 @@ impl App {
             Ev::Net(buf) => self.on_net(&buf, now),
             Ev::Adb(adb::Event::Launched(key)) => {
                 (self.key, self.rx_seq, self.dirty) = (Some(key), 0, true);
+                let _ = self.clip.send(clip::Cmd::Key(key));
                 self.adb_status = "server started, waiting for its reply".into();
             }
             Ev::Adb(adb::Event::Failed(e)) => {
                 log!("{e}");
                 self.adb_status = e;
+            }
+            Ev::Clip(text) => {
+                let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+                log!("clipboard: {} bytes from the tablet", text.len());
+                clip::set(self.hwnd, &text);
+                *self.clip_last.lock().unwrap() = Some(text);
             }
         }
     }
@@ -324,6 +342,7 @@ impl App {
                 self.park = Some((clip, Some(prev).filter(|p| *p != win_rect(screen()))));
                 self.wheel_acc = [0; 2];
                 log!("tablet has control, entry at {:.1}%", f as f32 / 655.35);
+                let _ = self.clip.send(clip::Cmd::Enter);
             }
             Action::Leave(to) => {
                 self.st.active = false;
@@ -450,7 +469,7 @@ impl App {
 
     fn menu(&mut self) {
         let status = self.status(Instant::now()).1.replace('\n', " | ");
-        match tray::menu(self.hwnd, &status, !self.paused, self.cfg.side) {
+        match tray::menu(self.hwnd, &status, !self.paused, self.cfg.side, !self.cfg.share_private) {
             cmd @ (tray::CMD_LEFT | tray::CMD_RIGHT) => {
                 let side = if cmd == tray::CMD_LEFT { Side::Left } else { Side::Right };
                 if side != self.cfg.side {
@@ -458,7 +477,7 @@ impl App {
                     self.bye();
                     self.cfg.side = side;
                     self.sw = Switch::new(side, self.cfg.push_counts); // offline until the new server answers
-                    Config::save_side(side);
+                    Config::save("side", side.name());
                     if !self.paused {
                         // The server takes the side at launch (warp corner, strip edge).
                         self.launch_at = Some(Instant::now());
@@ -466,6 +485,13 @@ impl App {
                         let _ = self.launch.send(self.cfg.clone());
                     }
                 }
+            }
+            tray::CMD_KEEP_PRIVATE => {
+                self.cfg.share_private = !self.cfg.share_private;
+                let v = if self.cfg.share_private { "share" } else { "keep" };
+                log!("tray: private clipboard text: {v}");
+                Config::save("private_clipboard", v);
+                let _ = self.clip.send(clip::Cmd::SharePrivate(self.cfg.share_private));
             }
             tray::CMD_CONNECT if self.paused => (self.paused, self.launch_at) = (false, None),
             tray::CMD_CONNECT => {
@@ -526,13 +552,18 @@ fn run(cfg: Config) {
     });
     let (launch, launch_rx) = mpsc::channel();
     std::thread::spawn(move || adb::thread(launch_rx, |e| emit_wake(Ev::Adb(e))));
+    let (clip, clip_rx) = mpsc::channel();
+    let clip_last = clip::Last::default();
+    let (ip, last) = (cfg.tablet_ip.clone(), clip_last.clone());
+    let share_private = cfg.share_private;
+    std::thread::spawn(move || clip::thread(ip, clip_rx, last, share_private, |t| emit_wake(Ev::Clip(t))));
 
     let now = Instant::now();
     let mut app = App {
         cfg: cfg.clone(), hwnd, hider, sock, key: None, tx_seq: 0, rx_seq: 0, st: PcState::default(),
         sw: Switch::new(cfg.side, cfg.push_counts), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None,
         dirty: false, last_send: now, key_balance: 0, hook_seen: capture::HOOK_KEYS.load(Relaxed),
-        balance_since: None, launch, launch_at: None, paused: false, tab: None, heard: None,
+        balance_since: None, launch, launch_at: None, clip, clip_last, paused: false, tab: None, heard: None,
         samples: VecDeque::new(), adb_status: "starting".into(), tip_at: now, stats_at: now, quit: false,
     };
     log!("running");

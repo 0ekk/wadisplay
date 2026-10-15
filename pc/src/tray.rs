@@ -1,4 +1,5 @@
-//! Notification-area icon: tooltip status and a menu (tablet side, Connect/Disconnect, Quit).
+//! Notification-area icon: tooltip status and a menu (tablet side, private clipboard text,
+//! Connect/Disconnect, Quit).
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
@@ -14,6 +15,7 @@ pub const CMD_CONNECT: u32 = 1;
 pub const CMD_QUIT: u32 = 2;
 pub const CMD_LEFT: u32 = 3;
 pub const CMD_RIGHT: u32 = 4;
+pub const CMD_KEEP_PRIVATE: u32 = 5;
 
 /// The tray picture; values are icon group ids in the exe (build.rs).
 #[derive(Clone, Copy)]
@@ -64,7 +66,7 @@ pub fn remove(hwnd: HWND) {
 }
 
 /// Shows the menu at the cursor; returns the chosen CMD_* (0 = dismissed).
-pub fn menu(hwnd: HWND, status: &str, connected: bool, side: Side) -> u32 {
+pub fn menu(hwnd: HWND, status: &str, connected: bool, side: Side, keep_private: bool) -> u32 {
     unsafe {
         let Ok(m) = CreatePopupMenu() else { return 0 };
         let status = HSTRING::from(status);
@@ -73,6 +75,9 @@ pub fn menu(hwnd: HWND, status: &str, connected: bool, side: Side) -> u32 {
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(m, MF_STRING | check(Side::Left), CMD_LEFT as usize, w!("Tablet on the left"));
         let _ = AppendMenuW(m, MF_STRING | check(Side::Right), CMD_RIGHT as usize, w!("Tablet on the right"));
+        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(m, MF_STRING | if keep_private { MF_CHECKED } else { MF_UNCHECKED },
+                            CMD_KEEP_PRIVATE as usize, w!("Keep private clipboard text on this PC"));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(m, MF_STRING, CMD_CONNECT as usize, if connected { w!("Disconnect") } else { w!("Connect") });
         let _ = AppendMenuW(m, MF_STRING, CMD_QUIT as usize, w!("Quit"));

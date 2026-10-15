@@ -7,6 +7,15 @@ use chacha20poly1305::ChaCha20Poly1305;
 pub const PORT: u16 = 27183;
 pub const DIR_PC: u8 = 0;
 pub const DIR_TAB: u8 = 1;
+/// Clipboard text travels over TCP (`CLIP_PORT`), sealed with the same key; these
+/// directions keep its nonces apart from the datagrams'.
+pub const CLIP_PORT: u16 = 27185;
+pub const DIR_PC_CLIP: u8 = 2;
+pub const DIR_TAB_CLIP: u8 = 3;
+/// Largest clipboard text, in UTF-8 bytes, that either side sends.
+pub const MAX_CLIP: usize = 1 << 20;
+/// Largest sealed clipboard frame: seq + text + tag.
+pub const MAX_SEALED: usize = 8 + MAX_CLIP + 16;
 
 /// Where the tablet sits relative to the PC monitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,15 +203,28 @@ fn nonce(dir: u8, seq: u64) -> [u8; 12] {
 
 /// Datagram = seq (clear, AAD) | ciphertext | tag. `seq` must start at 1 and grow.
 pub fn seal(key: &[u8; 32], dir: u8, seq: u64, msg: &Msg) -> Vec<u8> {
-    let aad = seq.to_le_bytes();
-    let ct = ChaCha20Poly1305::new(key.into())
-        .encrypt(&nonce(dir, seq).into(), Payload { msg: &msg.encode(), aad: &aad })
-        .expect("chacha20poly1305 encrypt cannot fail for small messages");
-    [&aad[..], &ct].concat()
+    seal_bytes(key, dir, seq, &msg.encode())
 }
 
 /// Accepts only authentic datagrams with `seq > last_seq`, then advances `last_seq`.
 pub fn open(key: &[u8; 32], dir: u8, buf: &[u8], last_seq: &mut u64) -> Option<Msg> {
+    let mut seq = *last_seq;
+    let msg = Msg::decode(&open_bytes(key, dir, buf, &mut seq)?)?;
+    *last_seq = seq;
+    Some(msg)
+}
+
+/// `seal` for any bytes. Never reuse a (key, dir, seq).
+pub fn seal_bytes(key: &[u8; 32], dir: u8, seq: u64, pt: &[u8]) -> Vec<u8> {
+    let aad = seq.to_le_bytes();
+    let ct = ChaCha20Poly1305::new(key.into())
+        .encrypt(&nonce(dir, seq).into(), Payload { msg: pt, aad: &aad })
+        .expect("chacha20poly1305 encrypt cannot fail below 256 GiB");
+    [&aad[..], &ct].concat()
+}
+
+/// `open` for any bytes.
+pub fn open_bytes(key: &[u8; 32], dir: u8, buf: &[u8], last_seq: &mut u64) -> Option<Vec<u8>> {
     let seq = u64::from_le_bytes(buf.get(..8)?.try_into().ok()?);
     if seq <= *last_seq {
         return None;
@@ -210,9 +232,38 @@ pub fn open(key: &[u8; 32], dir: u8, buf: &[u8], last_seq: &mut u64) -> Option<M
     let pt = ChaCha20Poly1305::new(key.into())
         .decrypt(&nonce(dir, seq).into(), Payload { msg: &buf[8..], aad: &buf[..8] })
         .ok()?;
-    let msg = Msg::decode(&pt)?;
     *last_seq = seq;
-    Some(msg)
+    Some(pt)
+}
+
+/// Stream frame: u32 little-endian length, then the bytes.
+pub fn frame(b: &[u8]) -> Vec<u8> {
+    [&(b.len() as u32).to_le_bytes()[..], b].concat()
+}
+
+/// Splits a byte stream back into `frame`s.
+#[derive(Default)]
+pub struct Frames(Vec<u8>);
+
+impl Frames {
+    /// Appends received bytes and returns the frames now complete; None once a frame
+    /// announces more than `max` bytes (the stream is then unusable).
+    pub fn push(&mut self, b: &[u8], max: usize) -> Option<Vec<Vec<u8>>> {
+        self.0.extend_from_slice(b);
+        let mut out = vec![];
+        loop {
+            let Some(len) = self.0.get(..4) else { return Some(out) };
+            let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+            if len > max {
+                return None;
+            }
+            if self.0.len() < 4 + len {
+                return Some(out);
+            }
+            out.push(self.0[4..4 + len].to_vec());
+            self.0.drain(..4 + len);
+        }
+    }
 }
 
 pub fn hex(b: &[u8]) -> String {
@@ -275,6 +326,24 @@ mod tests {
         let older = seal(&key, DIR_PC, 9, &Msg::Bye);
         assert_eq!(open(&key, DIR_PC, &older, &mut last), None, "older seq");
         assert_eq!(open(&key, DIR_PC, &d[..7], &mut last), None, "short");
+    }
+
+    #[test]
+    fn clip_frames_split_and_join() {
+        let key = [5; 32];
+        let (a, b) = (seal_bytes(&key, DIR_TAB_CLIP, 1, "héllo\n".as_bytes()), seal_bytes(&key, DIR_TAB_CLIP, 2, b""));
+        let stream = [frame(&a), frame(&b)].concat();
+        let mut f = Frames::default();
+        assert_eq!(f.push(&stream[..3], MAX_SEALED), Some(vec![]), "length split");
+        assert_eq!(f.push(&stream[3..20], MAX_SEALED), Some(vec![]), "body split");
+        let got = f.push(&stream[20..], MAX_SEALED).unwrap();
+        assert_eq!(got, vec![a, b]);
+        let mut last = 0;
+        assert_eq!(open_bytes(&key, DIR_TAB_CLIP, &got[0], &mut last).as_deref(), Some("héllo\n".as_bytes()));
+        assert_eq!(open_bytes(&key, DIR_PC_CLIP, &got[1], &mut last), None, "other direction");
+        assert_eq!(open_bytes(&key, DIR_TAB_CLIP, &got[0], &mut last), None, "replay");
+        assert_eq!(open_bytes(&key, DIR_TAB_CLIP, &got[1], &mut last), Some(vec![]));
+        assert_eq!(Frames::default().push(&frame(&[0; 9]), 8), None, "too long");
     }
 
     #[test]

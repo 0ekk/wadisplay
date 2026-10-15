@@ -23,7 +23,8 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
 1. Injection: Rust native server running as shell uid creates two UHID devices (relative mouse, NKRO
    keyboard) -> native pointer, native IME and shortcuts. USB once after each tablet reboot is accepted.
 2. Switching: edge crossing both ways + force-toggle hotkey `Ctrl+Alt+Space` (PC-local, never forwarded).
-3. v1 scope: mouse + keyboard + switching. Clipboard -> v1.1. No file drag-and-drop, one tablet.
+3. v1 scope: mouse + keyboard + switching. Clipboard -> v1.1 (done: decision 25). No file
+   drag-and-drop, one tablet.
 4. PC side: Rust + windows-rs, single exe.
 5. Transport: encrypted UDP state snapshots (see Wire format).
 6. Entering the tablet: pointer appears at the proportional y on the tablet's entry edge.
@@ -63,6 +64,12 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
 24. (2026-10-16, user request, before the first push to a public GitHub repo) The repo carries no
     local details: no LAN IPs, device or PC models, screen sizes or local paths in the docs, and no
     built-in tablet IP in the code. The rewritten history is applied to every commit.
+25. (2026-10-16, user request) Shared clipboard, text only. The clipboard follows the pointer: when
+    the tablet takes control it gets the PC's text (if it changed since the last sync); when the PC
+    takes control back it gets the tablet's new text.
+26. (2026-10-16, user request) A tray toggle, "Keep private clipboard text on this PC" (checked by
+    default), decides whether text marked private by its app (password managers) is shared too.
+    Saved as `private_clipboard=keep|share` in `wadisplay.ini`.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -73,6 +80,8 @@ PC (wadisplay.exe, elevated)                   Tablet
  main thread: Raw Input, ClipCursor, tray <---> 0.0.0.0:27183  -> /dev/uhid (mouse, keyboard)
  adb thread: connect / re-arm / deploy          127.0.0.1:27184 <- companion app (EdgeService)
                                                                    1px overlay strip on return edge
+ clip thread: clipboard text              TCP   0.0.0.0:27185  <-> clipboard helper (Clip.kt via
+                                         <--->                      app_process, shell uid; pipes)
 ```
 
 ### Wire format (`proto` crate, hand-written little-endian, no serde)
@@ -137,15 +146,18 @@ PC (wadisplay.exe, elevated)                   Tablet
   events, display size/rotation, screen/keyguard state and a 1 Hz heartbeat to 127.0.0.1:27184 with the
   token from `--es tok`. Holds a `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi lock while running.
 - `MainActivity`: connection status + an `EditText` used as the typing test field.
+- `Clip` (not an Android component): the clipboard helper the server runs from this APK with
+  `app_process` as the shell user (decision 25).
 
 ## Repo layout (new files)
 - `Cargo.toml` (workspace), `proto/src/lib.rs`
 - `pc/src/main.rs`, `pc/src/capture.rs` (hooks, raw input, clip), `pc/src/switch.rs` (pure crossing
   state machine), `pc/src/keymap.rs` (scancode -> HID usage), `pc/src/adb.rs`, `pc/src/tray.rs`,
+  `pc/src/clip.rs` (clipboard sync),
   `pc/wadisplay.exe.manifest` (requireAdministrator, PerMonitorV2 DPI), `pc/icon/` (icon sources + PNGs)
 - `server/src/main.rs`, `server/src/uhid.rs`, `server/src/warp.rs`
 - `android/` (Gradle wrapper, `app/src/main/AndroidManifest.xml`, `EdgeService.kt`, `MainActivity.kt`,
-  `res/` launcher and notification icons)
+  `Clip.kt`, `res/` launcher and notification icons)
 - `AGENTS.md` (build/test/deploy commands), `docs/plan/2026-10-15-deskdock-clone.md` (this design +
   per-milestone rationale/decisions/impact/verification)
 - Crates: `windows`, `chacha20poly1305`, `getrandom`, `libc`. Nothing else without asking.
@@ -480,3 +492,88 @@ under "Open checks".
   the original; `git log --format=%G?` is `G` for all 8; the same history scan finds none of the
   removed strings. `cargo.exe build --release --locked -p wadisplay-pc` (no warnings) and
   `cargo.exe test -p wadisplay-pc` (7) pass.
+
+### Shared clipboard (2026-10-16, decision 25)
+- Rationale: copying on one device and pasting on the other was the main gap left from v1
+  (decision 3).
+- Findings (tablet, adb): Android 10+ lets only the focused app and the default IME read the
+  clipboard, so `EdgeService` cannot. The shell user holds `READ_CLIPBOARD_IN_BACKGROUND` and can
+  call the hidden `IClipboard` service (no `cmd clipboard` on this build). A spike under
+  `app_process` read, wrote and got change callbacks. Reading a clip another app wrote shows a
+  system toast, "Shell read the clipboard."; AOSP skips it when the reader owns the clip and shows
+  it once per clip and reader.
+- Decisions:
+  - The clipboard follows the pointer instead of syncing every copy: when the tablet takes
+    control (`Action::Enter`) the PC sends its text if it differs from the last synced text; when
+    the PC takes control back the server asks the helper for the tablet's text, which it reports
+    only if the clip changed since and differs from what it last saw or set. So the toast appears
+    at most once per tablet copy, as the pointer leaves the tablet, and text never moves to a
+    device the user is not on. Neither side treats a clip it just received as new.
+  - Text only, up to `MAX_CLIP` = 1 MiB of UTF-8; larger text and other formats stay put. Line ends
+    are LF on the wire and on the tablet, CRLF on the PC.
+  - Transport: TCP to `CLIP_PORT` 27185 (the server listens; the PC connects after each launch),
+    frames = u32 LE length + `seal_bytes(seq | ciphertext | tag)` under the session key with
+    nonce directions 2 (PC->tablet) and 3 (tablet->PC), apart from the datagrams' 0 and 1. Sequence
+    numbers belong to the key, not the connection, so reconnects never reuse a nonce or accept a
+    replay. The latest connection wins (someone on the LAN can break the sync, not read or forge
+    it). TCP rather than more datagrams: clips can be large and must arrive whole.
+  - Tablet: `Clip.kt` in the companion APK, started by the server as
+    `CLASSPATH=<apk from pm path> app_process / com.wadisplay.companion.Clip` (shell uid), talking
+    frames over stdin/stdout (type `G` = report if changed, `S` + text = set; reply `T` + text).
+    Methods are found by name and their arguments filled by type (package, attribution tag, user
+    and device ids), since the AIDL signatures change between Android versions. A bare `Binder`
+    stands in for `IOnPrimaryClipChangedListener` (one oneway call), so no AIDL files. The helper
+    exits when its stdin closes, i.e. with the server; the server restarts it at most every 5 s.
+  - PC: `clip.rs` thread owns the connection and reads the clipboard on Enter (delayed rendering by
+    another app can take a while; the input thread never waits). Writing happens on the main
+    thread, whose window must own the clipboard for `SetClipboardData`. Text marked
+    `ExcludeClipboardContentFromMonitorProcessing` (password managers) is not sent unless the user
+    unchecks "Keep private clipboard text on this PC" (decision 26). Logs show sizes, never content.
+  - The server writes tablet text to the PC with a blocking write (2 s timeout) from its input
+    loop; that only happens right after the PC took control (`ponytail:` note in the code).
+  - Not done: images and files; a tray switch to turn sharing off; hiding the toast (the
+    `clipboard_show_access_notifications` setting would hide it for every app).
+- Impact: new TCP port on the tablet, a second shell process (`app_process`) while the server
+  runs, `Clip.kt` in the APK, `pc/src/clip.rs`, windows features `Win32_System_DataExchange`,
+  `Win32_System_Memory`, `Win32_System_Ole`.
+- Verification: proto test `clip_frames_split_and_join` (split frames, other direction, replay,
+  oversize). On the tablet, two helper instances run from the APK file (not installed) while a
+  third process held and later restored the user's clip: a fresh helper reports nothing, its own
+  write is not echoed, another writer's text (UTF-8, newline) is reported exactly once, an
+  unchanged clip is not reported, both exit on stdin EOF. Windows `adb.exe` turns LF into CRLF on
+  its stdout (stdin is untouched), so that test read the helper's output from a file; the real
+  helper talks to the server over local pipes. `cargo test` (proto 4, server 10), `cargo.exe test
+  -p wadisplay-pc` (7) and release builds pass without warnings. End to end on the tablet, the
+  real server with a scratch client speaking the wire format (UDP enter/leave, TCP clipboard
+  frames), the user's clip held and restored: the PC's text (UTF-8, newline) reached the tablet
+  clipboard; leaving without a tablet copy sent nothing; a copy by another writer reached the PC
+  exactly once; an unchanged clip was not sent again; on Bye the server exited cleanly and the
+  helper with it. Open check (user, PC side): copy/paste both ways, password-manager text with the
+  tray item checked and unchecked.
+- Follow-up, stale paste in one app (user report, 2026-10-16): in Termius 7.7.1 on the tablet,
+  Ctrl+V right after crossing pasted the previous text, the new text about 5 s later; other apps
+  pasted the new text at once (user test). Measured: every PC send in the logs reached the server
+  within 1 ms and was on the system clipboard about 20 ms later; HarmonyOS's `ClipboardService`
+  logs every read, and during the stale paste Termius made none (only the IME and the
+  distributed pasteboard read, right after the set), so Termius pastes from a copy of its own. The
+  IME's `hasPermission? false` for shell-set clips only decides whether it labels the source
+  device and app, so setting the clip from the companion app's uid would not help. Decision: no
+  change; README lists it under Limitations. Syncing every PC copy instead of at crossing would
+  hide the delay but sends text to a device the user is not on (decision 25), so not done.
+
+### Private clipboard text toggle (2026-10-16, decision 26)
+- Rationale: password managers mark copies with `ExcludeClipboardContentFromMonitorProcessing` so
+  clipboard monitors skip them; the user wants to choose whether that applies here (for example,
+  to paste a password on the tablet).
+- Decisions: tray item "Keep private clipboard text on this PC", checked = keep (the default and
+  the previous behavior), placed between the side items and Connect. ini key
+  `private_clipboard=keep|share` (spelled-out values instead of yes/no; anything but `share` keeps);
+  files without the key keep. Toggling writes the key with `set_ini_key` (`Config::save_side`
+  became `Config::save(key, value)`) and sends `clip::Cmd::SharePrivate` to the clipboard thread,
+  so it applies from the next crossing without a restart. Only the PC side has such a marker; the
+  tablet's (Android 13 `EXTRA_IS_SENSITIVE`) does not exist on this Android 12 build.
+- Impact: `tray::menu` takes `keep_private`; `clip::thread` takes the initial `share_private`.
+- Verification: `cargo.exe build --release --locked -p wadisplay-pc` (no warnings) and
+  `cargo.exe test -p wadisplay-pc` (7, incl. `set_ini_key`) pass. Open check, with the clipboard
+  checks: copy from a password manager, cross with the item checked (tablet clipboard unchanged)
+  and unchecked (tablet gets it); the ini line follows the menu.

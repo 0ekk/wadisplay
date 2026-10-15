@@ -1,14 +1,16 @@
 //! wadisplay-server: runs as the adb shell uid on the tablet. Turns PcState snapshots into
 //! UHID mouse/keyboard input, detects pushes out of the return edge, reports TabState.
+//! Relays clipboard text between the PC (TCP) and the clipboard helper (Clip.kt).
 //! Startup line on stdin: `<key hex> <app token hex> <side> <push_counts>`.
 
 mod uhid;
 mod warp;
 
 use std::fs;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
@@ -30,6 +32,8 @@ const APP_TIMEOUT: Duration = Duration::from_secs(3);
 const THAW_MIN: Duration = Duration::from_millis(100);
 const FROZEN_CHECK: Duration = Duration::from_millis(20);
 const APP_PKG: &str = "com.wadisplay.companion";
+const HELPER_CLASS: &str = "com.wadisplay.companion.Clip";
+const HELPER_RETRY: Duration = Duration::from_secs(5);
 
 static TERM: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
@@ -248,6 +252,30 @@ fn ime_put(v: &str) {
     }
 }
 
+/// The clipboard helper: Clip.kt from the companion APK under app_process, as shell, which
+/// may read the clipboard in the background. Frames: type byte + UTF-8 text.
+struct Helper {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    frames: proto::Frames,
+}
+
+fn spawn_helper() -> Option<Helper> {
+    let path = sh(&["pm", "path", APP_PKG]);
+    let apk = path.lines().find_map(|l| l.strip_prefix("package:"))?;
+    let mut child = Command::new("/system/bin/app_process")
+        .env("CLASSPATH", apk)
+        .args(["/", HELPER_CLASS])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| log!("clipboard helper: {e}"))
+        .ok()?;
+    log!("clipboard helper started, pid {}", child.id());
+    Some(Helper { stdin: child.stdin.take()?, stdout: child.stdout.take()?, child, frames: Default::default() })
+}
+
 struct Server {
     key: [u8; 32],
     token: [u8; 16],
@@ -269,6 +297,13 @@ struct Server {
     service_at: Option<Instant>,
     app_pid: Option<u32>,
     frozen_check: Instant,
+    clip_listener: TcpListener,
+    /// The PC's clipboard connection; the latest one wins.
+    clip_conn: Option<(TcpStream, proto::Frames)>,
+    clip_rx_seq: u64,
+    clip_tx_seq: u64,
+    helper: Option<Helper>,
+    helper_at: Option<Instant>,
 }
 
 impl Server {
@@ -279,13 +314,30 @@ impl Server {
             if TERM.load(Relaxed) {
                 return log!("terminated");
             }
-            let mut fds = [self.sock.as_raw_fd(), self.app_sock.as_raw_fd(), self.mouse.fd(), self.kbd.fd()]
+            let clip_fd = self.clip_conn.as_ref().map_or(-1, |c| c.0.as_raw_fd());
+            let helper_fd = self.helper.as_ref().map_or(-1, |h| h.stdout.as_raw_fd());
+            let mut fds = [self.sock.as_raw_fd(), self.app_sock.as_raw_fd(), self.mouse.fd(), self.kbd.fd(),
+                           self.clip_listener.as_raw_fd(), clip_fd, helper_fd]
                 .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
             let timeout = self.timeout(Instant::now());
             unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
             let now = Instant::now();
             self.mouse.read_events();
             self.kbd.read_events();
+            // Blocking reads, only after poll reported data (or EOF) for that very fd.
+            if fds[5].revents != 0 {
+                self.on_clip_conn(now);
+            }
+            if fds[6].revents != 0 {
+                self.on_helper();
+            }
+            while let Ok((c, from)) = self.clip_listener.accept() {
+                log!("clipboard: PC connected from {from}");
+                let _ = c.set_nonblocking(false);
+                let _ = c.set_nodelay(true);
+                let _ = c.set_write_timeout(Some(Duration::from_secs(2)));
+                self.clip_conn = Some((c, proto::Frames::default()));
+            }
             while let Ok((n, from)) = self.sock.recv_from(&mut buf) {
                 if !self.on_packet(&buf[..n], from, now) {
                     return;
@@ -383,6 +435,10 @@ impl Server {
                 if s.active != was {
                     log!("{}", if s.active { "tablet has control" } else { "PC has control" });
                     let _ = self.jobs.send(Job::Ime(!s.active));
+                    if !s.active {
+                        // The clipboard follows the pointer: hand the tablet's new text to the PC.
+                        self.helper_send(b'G', b"", now);
+                    }
                 }
                 if !s.active {
                     self.reply(now);
@@ -409,6 +465,84 @@ impl Server {
         let d = proto::seal(&self.key, proto::DIR_TAB, self.tx_seq, &Msg::Tab(ts));
         let _ = self.sock.send_to(&d, peer);
         self.last_reply = now;
+    }
+
+    /// PC -> tablet clipboard text (sent when the tablet takes control).
+    fn on_clip_conn(&mut self, now: Instant) {
+        let Some((conn, frames)) = &mut self.clip_conn else { return };
+        let mut buf = vec![0; 64 << 10];
+        let got = match conn.read(&mut buf) {
+            Ok(n) if n > 0 => frames.push(&buf[..n], proto::MAX_SEALED),
+            _ => None,
+        };
+        let Some(got) = got else {
+            log!("clipboard: PC connection closed");
+            self.clip_conn = None;
+            return;
+        };
+        for f in got {
+            match proto::open_bytes(&self.key, proto::DIR_PC_CLIP, &f, &mut self.clip_rx_seq) {
+                Some(text) if text.len() <= proto::MAX_CLIP => {
+                    log!("clipboard: {} bytes from the PC", text.len());
+                    self.helper_send(b'S', &text, now);
+                }
+                _ => log!("clipboard: dropped a frame that does not authenticate"),
+            }
+        }
+    }
+
+    /// Tablet -> PC clipboard text, answering a 'G'.
+    fn on_helper(&mut self) {
+        let Some(h) = &mut self.helper else { return };
+        let mut buf = vec![0; 64 << 10];
+        let got = match h.stdout.read(&mut buf) {
+            Ok(n) if n > 0 => h.frames.push(&buf[..n], 1 + proto::MAX_CLIP),
+            _ => None,
+        };
+        let Some(got) = got else {
+            log!("clipboard helper: exited or sent garbage");
+            return self.stop_helper();
+        };
+        for f in got.iter().filter(|f| f.first() == Some(&b'T')) {
+            self.send_clip(&f[1..]);
+        }
+    }
+
+    fn send_clip(&mut self, text: &[u8]) {
+        let Some((conn, _)) = &mut self.clip_conn else {
+            return log!("clipboard: {} bytes not sent, no PC connection", text.len());
+        };
+        self.clip_tx_seq += 1;
+        let f = proto::frame(&proto::seal_bytes(&self.key, proto::DIR_TAB_CLIP, self.clip_tx_seq, text));
+        // ponytail: blocking write (2 s timeout) in the input loop; it runs right after the PC
+        // took control, so no tablet input waits. A writer thread if huge clips ever matter.
+        match conn.write_all(&f) {
+            Ok(()) => log!("clipboard: {} bytes to the PC", text.len()),
+            Err(e) => {
+                log!("clipboard: {e}");
+                self.clip_conn = None;
+            }
+        }
+    }
+
+    /// Starts the helper if it is not running (at most every HELPER_RETRY), then sends a frame.
+    fn helper_send(&mut self, kind: u8, text: &[u8], now: Instant) {
+        if self.helper.is_none() && self.helper_at.map_or(true, |t| now - t >= HELPER_RETRY) {
+            self.helper_at = Some(now);
+            self.helper = spawn_helper();
+        }
+        let Some(h) = &mut self.helper else { return };
+        if let Err(e) = h.stdin.write_all(&proto::frame(&[&[kind][..], text].concat())) {
+            log!("clipboard helper: {e}");
+            self.stop_helper();
+        }
+    }
+
+    fn stop_helper(&mut self) {
+        if let Some(mut h) = self.helper.take() {
+            let _ = h.child.kill();
+            let _ = h.child.wait();
+        }
     }
 
     fn on_app(&mut self, b: &[u8], from: SocketAddr, now: Instant) {
@@ -522,6 +656,15 @@ fn main() {
     // Bind and create devices before forking so failures reach the adb caller.
     let sock = bind(&format!("0.0.0.0:{}", proto::PORT));
     let app_sock = bind(&format!("127.0.0.1:{APP_PORT}"));
+    let clip_listener = (0..20).find_map(|_| {
+        TcpListener::bind(("0.0.0.0", proto::CLIP_PORT))
+            .map_err(|_| std::thread::sleep(Duration::from_millis(100)))
+            .ok()
+    }).unwrap_or_else(|| {
+        eprintln!("cannot bind tcp port {}", proto::CLIP_PORT);
+        std::process::exit(1)
+    });
+    clip_listener.set_nonblocking(true).unwrap();
     let create = |name: &str, pid: u32, desc: &[u8]| Uhid::create(name, pid, desc).unwrap_or_else(|e| {
         eprintln!("/dev/uhid: {e}");
         std::process::exit(1)
@@ -585,8 +728,10 @@ fn main() {
         rx_seq: 0, tx_seq: 0, peer: None,
         last_rx: now, last_reply: now, echo: (0, now), apply_us: 0,
         app: None, app_at: None, service_at: None, app_pid: None, frozen_check: now,
+        clip_listener, clip_conn: None, clip_rx_seq: 0, clip_tx_seq: 0, helper: spawn_helper(), helper_at: Some(now),
     };
     s.run();
+    s.stop_helper();
 
     // Shut down: release input, destroy devices, let queued jobs finish, then restore.
     s.input.release();
