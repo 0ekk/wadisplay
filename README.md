@@ -85,6 +85,11 @@ Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each star
 - Android hides app overlays on the lock screen, in the notification shade and on Settings,
   permission and installer screens. The edge back to the PC does not work there; use the hotkey.
 - With the tablet screen off, edges are inactive; the hotkey still enters (a key or click wakes it).
+  After a wake the edges work again once the companion app reports, a few seconds after unlock.
+- On battery, HarmonyOS turns the tablet's Wi-Fi off about 9 minutes after the screen goes off.
+  Nothing reaches the tablet until you unlock it; wadisplay then reconnects by itself. To keep the
+  hotkey working, turn on Settings > Battery > More battery settings > "Stay connected when device is
+  asleep"; it costs battery, since wadisplay's once-a-second heartbeat keeps the tablet awake.
 - `adb tcpip` does not survive a tablet reboot: plug in USB once after each reboot and wadisplay
   re-enables it by itself.
 - A UAC prompt at every start: the exe runs elevated so that it also sees input aimed at elevated

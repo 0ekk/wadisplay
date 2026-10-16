@@ -73,6 +73,10 @@ Impact: new project (Windows exe, Android shell-uid server, companion APK); noth
 27. (2026-10-16, user request) The shared clipboard carries images too, both ways, under the same
     rules as text (follows the pointer, private marker respected): PNG on the wire from the PC, PNG
     or JPEG from the tablet.
+28. (2026-10-16, user choice) The user's tablet keeps Wi-Fi on while asleep (HarmonyOS "Stay
+    connected when device is asleep", set by hand; wadisplay changes no system setting), trading
+    battery for a tablet the hotkey can reach at any time. A sleeping tablet must not cost a server
+    relaunch while the server still runs.
 Defaults stated and not objected to: tablet sits right of the monitor (`side` in config:
 left/right/top/bottom); PC returns control after 300 ms without tablet heartbeat.
 
@@ -118,6 +122,8 @@ PC (wadisplay.exe, elevated)                   Tablet
   Disable power throttling (`SetProcessInformation(ProcessPowerThrottling)`).
 - Config `%LOCALAPPDATA%\wadisplay\wadisplay.ini` (hand-parsed `key=value`): `tablet_ip`, `adb`, `side`,
   `push_counts`; the log is `wadisplay.log` beside it (decision 20).
+- After 3 s without a reply, at most every 10 s: relaunch the server over adb, or, when its pid is
+  known, only if that pid no longer runs `wadisplay-server` (decision 28).
 
 ### Server rules
 - Startup: read hex key + app token from stdin; kill old instance via pidfile; fork, `setsid`, fds to
@@ -129,7 +135,7 @@ PC (wadisplay.exe, elevated)                   Tablet
 - Counters: apply diffs of cumulative values; rebase without applying when `active` turns on and when
   `warp_id` changes.
 - Release all keys/buttons when `active` turns off or after 150 ms without a valid packet while active.
-  Exit (destroy devices, restore setting) after 10 s without any valid packet or on `Bye`.
+  Exit (destroy devices, restore setting) after 60 s without any valid packet (10 s until 2026-10-16, see "Tablet sleep") or on `Bye`.
 - Reply with TabState every 20 ms while active (keeps Wi-Fi out of power save, RTT echo), and to every
   packet while idle.
 - Return detection: pointer inside the strip AND accumulated outward dx >= `push_counts` AND no tablet
@@ -142,7 +148,9 @@ PC (wadisplay.exe, elevated)                   Tablet
   - `gain` starts at 2^(pointer_speed/4) and is refined from strip readbacks. A readback times out at
     100 ms (no readback under the status bar).
 - `settings put secure show_ime_with_hard_keyboard 0|1` runs on a side thread, never on the input path.
-- Restart the companion service (`am start-foreground-service`) if no app heartbeat for 3 s.
+- Restart the companion service (`am start-foreground-service`) if no app heartbeat for 3 s, and
+  thaw the frozen app (M2) only while its last report says the screen is on; before the first
+  report the screen counts as off (decision 28).
 
 ### Companion app (`com.wadisplay.companion`, minSdk 29, targetSdk 34)
 - `EdgeService`: foreground service (`specialUse`). Adds a 1px `TYPE_APPLICATION_OVERLAY` strip
@@ -638,3 +646,52 @@ under "Open checks".
   helper exits on EOF. User test with the real exe: screenshots pasted into a chat app on the
   tablet, and an image copied on the tablet pasted on the PC; the logs show 3 KB to 70 KB images
   both ways.
+
+### Tablet sleep (2026-10-16, decision 28)
+- Rationale: the user found adb unreachable after the tablet had slept for a while. Before that,
+  with the tablet asleep, the PC relaunched the server over adb every 10 to 14 s; each relaunch
+  restarted the clipboard helper (a tablet copy not yet synced was lost) and the companion service.
+- Findings (the tablet on battery):
+  - Wi-Fi power save holds packets for the tablet back: with the screen off, replies came p99 450 to
+    700 ms late, with gaps over 3 s and at least one over 10 s; gaps over 3 s also happen with the
+    screen on but untouched. adb (TCP) still got through, so every relaunch replaced a healthy
+    server (it sat in `ppoll`, UDP counters still rising about once a second).
+  - Unless the tablet is charging, HarmonyOS turns Wi-Fi off about 9 minutes after the screen goes
+    off (`wifi_sleep_policy=1`; the Wi-Fi log shows `WIFI_DISABLED` and `DEAUTH_LEAVING` with the
+    screen off) and back on about 5 s after unlock, not on the lock screen alone. Settings >
+    Battery > More battery settings > "Stay connected when device is asleep" sets
+    `wifi_sleep_policy=2`.
+  - With the screen off, `cmd activity start-foreground-service` fails on the frozen app ("Error:
+    Not found; no service started"), so the M2 thaw retried about twice a second: 1900 failures,
+    each logged, in 16 minutes. Once a server exits it runs `am stopservice`; the empty app
+    process is then frozen, and starting the service fails on the lock screen too, until unlock.
+  - Before the app's first report the server said `screen_on true`; with the app dead, an
+    accidental edge entry woke the sleeping tablet.
+- Decisions:
+  - PC: after 3 s of silence with the server's pid known (parsed from the launch output "started,
+    pid N"), send `adb::Request::Revive`: adb checks `/proc/<pid>/cmdline`, and the server is
+    relaunched only if that pid no longer runs `wadisplay-server`. An adb error is reported as a
+    failure, never taken as "gone". A live server gives "tablet server running but not answering
+    (tablet asleep?)", logged once per silence and shown in the tray, unless it answered during the
+    check. The tray side switch still relaunches.
+  - Server: `EXIT_AFTER` 10 s -> 60 s. Keys still release after 150 ms of silence; the cost is
+    devices left on the tablet for up to a minute after a PC crash.
+  - Server: thaw the frozen app only while its last report says the screen is on. With the screen
+    off only the 3 s "app silent" restart runs, and that thaws the app once the tablet wakes.
+    Before the first report the screen counts as off (no edge entry; the hotkey still enters).
+  - Server: `sh` logs a failure only when it differs from the last one (a success clears it).
+  - The unreachable-adb message now names Wi-Fi off while asleep as well as a reboot. README
+    explains the Wi-Fi setting and its cost.
+- Impact: no wire format change; the launch output must keep "started, pid N". With Wi-Fi kept on,
+  the PC's 1 Hz heartbeat and the replies keep the tablet awake (suspended about 7% of a 16-minute
+  screen-off test). With the default policy, Wi-Fi goes off, the server exits a minute later, and
+  the PC relaunches it once adb gets through after unlock. Edges wait until the app reports after
+  wake (about 5 s after the screen came on, unlock included, in the test below).
+- Verification: `cargo test` (proto 5, server 10), `cargo.exe test -p wadisplay-pc` (8), release
+  builds without warnings. Three 15 to 16-minute screen-off tests on battery with the user's exe and
+  Wi-Fi kept on: (1) Revive only: no Wi-Fi drop, server, app and helper kept their pids, no
+  relaunch, but 1900 thaw failures; (2) with the thaw gate: about 4 minutes in, the server was
+  replaced (a Wi-Fi gap over 10 s or a failed adb check; the log was overwritten), its
+  `am stopservice` left the app dead until unlock, and an accidental edge entry woke the tablet;
+  (3) everything above: one server, app and helper throughout, one thaw failure logged, the edge
+  back in use right after unlock, entry and return working.

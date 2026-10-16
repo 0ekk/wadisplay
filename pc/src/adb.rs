@@ -18,9 +18,27 @@ static APK: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
 const PKG: &str = "com.wadisplay.companion";
 const DIR: &str = "/data/local/tmp";
 
+pub enum Request {
+    /// Start a server, replacing any.
+    Launch(Config),
+    /// The server with this pid stopped answering: start a new one only if it is gone. A
+    /// sleeping tablet's Wi-Fi can hold replies back for seconds while adb still gets through.
+    Revive(Config, u32),
+}
+
+impl Request {
+    fn cfg(&self) -> &Config {
+        match self {
+            Request::Launch(c) | Request::Revive(c, _) => c,
+        }
+    }
+}
+
 pub enum Event {
-    /// The server runs with this key.
-    Launched([u8; 32]),
+    /// The server runs with this key and pid.
+    Launched([u8; 32], u32),
+    /// Revive found the server still running.
+    Running,
     Failed(String),
 }
 
@@ -76,7 +94,7 @@ impl Adb<'_> {
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
-        Err(format!("cannot reach {} over adb (plug in USB once after a tablet reboot)", self.serial))
+        Err(format!("cannot reach {} over adb (tablet off Wi-Fi while asleep? After a tablet reboot, plug in USB once)", self.serial))
     }
 
     /// Pushes `data` to `path` unless the hash file next to it already matches.
@@ -116,7 +134,13 @@ impl Adb<'_> {
         Ok(())
     }
 
-    fn launch(&self) -> Result<[u8; 32], String> {
+    /// Whether the server with this pid still runs; Err when adb cannot tell.
+    fn running(&self, pid: u32) -> Result<bool, String> {
+        self.connect()?;
+        Ok(self.shell(&format!("grep -qs wadisplay-server /proc/{pid}/cmdline && echo alive || echo gone"))? == "alive")
+    }
+
+    fn launch(&self) -> Result<([u8; 32], u32), String> {
         self.connect()?;
         self.deploy()?;
         let (mut key, mut token) = ([0u8; 32], [0u8; 16]);
@@ -131,30 +155,44 @@ impl Adb<'_> {
         child.stdin.take().unwrap().write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         let o = child.wait_with_output().map_err(|e| e.to_string())?;
         let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-        if !out.contains("started") {
+        let Some(pid) = out.split("started, pid ").nth(1).and_then(|p| p.split_whitespace().next()?.parse().ok()) else {
             return Err(format!("server did not start: {}", out.trim()));
-        }
+        };
         log!("{}", out.trim());
-        Ok(key)
+        Ok((key, pid))
     }
 }
 
-/// Connects, deploys and starts the server; returns its key.
-pub fn launch(cfg: &Config) -> Result<[u8; 32], String> {
-    Adb { serial: format!("{}:5555", cfg.tablet_ip), cfg }.launch()
+fn adb(cfg: &Config) -> Adb<'_> {
+    Adb { serial: format!("{}:5555", cfg.tablet_ip), cfg }
 }
 
-/// Serves launch requests until the channel closes. Requests queued during a launch are
-/// dropped, unless the newest one changes the side.
-pub fn thread(rx: Receiver<Config>, emit: impl Fn(Event)) {
+/// Connects, deploys and starts the server; returns its key and pid.
+pub fn launch(cfg: &Config) -> Result<([u8; 32], u32), String> {
+    adb(cfg).launch()
+}
+
+/// Serves requests until the channel closes. Requests queued meanwhile are dropped, unless the
+/// newest one changes the side.
+pub fn thread(rx: Receiver<Request>, emit: impl Fn(Event)) {
     let mut next = rx.recv().ok();
-    while let Some(cfg) = next {
-        emit(match launch(&cfg) {
-            Ok(key) => Event::Launched(key),
+    while let Some(req) = next {
+        let cfg = req.cfg().clone();
+        // A failed check must not replace a server that may still run.
+        let running = match req {
+            Request::Revive(_, pid) => adb(&cfg).running(pid),
+            Request::Launch(_) => Ok(false),
+        };
+        emit(match running {
+            Ok(true) => Event::Running,
+            Ok(false) => match launch(&cfg) {
+                Ok((key, pid)) => Event::Launched(key, pid),
+                Err(e) => Event::Failed(e),
+            },
             Err(e) => Event::Failed(e),
         });
         next = match rx.try_iter().last() {
-            Some(c) if c.side != cfg.side => Some(c),
+            Some(r) if r.cfg().side != cfg.side => Some(r),
             _ => rx.recv().ok(),
         };
     }

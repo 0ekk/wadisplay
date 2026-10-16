@@ -12,7 +12,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use uhid::{key_reports, mouse_reports, KeyReport, MouseReport, Uhid};
@@ -26,7 +26,8 @@ const SERVICE: &str = "com.wadisplay.companion/.EdgeService";
 const APP_PORT: u16 = 27184;
 const REPLY_EVERY: Duration = Duration::from_millis(20);
 const RELEASE_AFTER: Duration = Duration::from_millis(150);
-const EXIT_AFTER: Duration = Duration::from_secs(10);
+/// A sleeping tablet's Wi-Fi can hold PC packets back for over 10 s.
+const EXIT_AFTER: Duration = Duration::from_secs(60);
 const APP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Rate limit for thawing; a thaw takes ~40 ms.
 const THAW_MIN: Duration = Duration::from_millis(100);
@@ -229,19 +230,25 @@ enum Job {
     StartService,
 }
 
+/// Runs a command and returns its stdout. A failure is logged unless it repeats the last one:
+/// with the screen off, HarmonyOS refuses to start the service of the frozen app every time.
 fn sh(args: &[&str]) -> String {
-    match Command::new(args[0]).args(&args[1..]).output() {
-        Ok(o) => {
-            if !o.status.success() {
-                log!("{args:?}: {} {}", o.status, String::from_utf8_lossy(&o.stderr).trim());
-            }
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let (out, err) = match Command::new(args[0]).args(&args[1..]).output() {
+        Ok(o) => (String::from_utf8_lossy(&o.stdout).trim().to_string(), (!o.status.success())
+            .then(|| format!("{args:?}: {} {}", o.status, String::from_utf8_lossy(&o.stderr).trim()))),
+        Err(e) => (String::new(), Some(format!("{args:?}: {e}"))),
+    };
+    let mut last = LAST.lock().unwrap();
+    match err {
+        Some(e) if *last != e => {
+            log!("{e}");
+            *last = e;
         }
-        Err(e) => {
-            log!("{args:?}: {e}");
-            String::new()
-        }
+        Some(_) => {}
+        None => last.clear(),
     }
+    out
 }
 
 fn ime_put(v: &str) {
@@ -361,10 +368,12 @@ impl Server {
             if self.input.pc.active && now - self.last_reply >= REPLY_EVERY {
                 self.reply(now);
             }
-            // (Re)start the service when the app went silent, or when HarmonyOS froze it.
+            // (Re)start the service when the app went silent, or when HarmonyOS froze it while
+            // the screen is on (with it off, starting fails; the silent retry thaws it on wake).
             let due = |d: Duration| self.service_at.map_or(true, |t| now - t >= d);
             let silent = self.app_at.map_or(true, |t| now - t > APP_TIMEOUT);
-            if (silent && due(APP_TIMEOUT)) || (due(THAW_MIN) && self.app_frozen(now)) {
+            let lit = self.app.as_ref().is_some_and(|a| a.screen_on);
+            if (silent && due(APP_TIMEOUT)) || (lit && due(THAW_MIN) && self.app_frozen(now)) {
                 self.service_at = Some(now);
                 let _ = self.jobs.send(Job::StartService);
             }
@@ -465,7 +474,7 @@ impl Server {
         let ts = TabState {
             echo_us: self.echo.0 + (now - self.echo.1).as_micros() as u64,
             apply_us: self.apply_us,
-            screen_on: app.map_or(true, |a| a.screen_on),
+            screen_on: app.is_some_and(|a| a.screen_on), // unknown: no edge entry
             locked: app.is_some_and(|a| a.locked),
             strip_visible: app.is_some_and(|a| a.visible),
             return_y: self.input.return_y,

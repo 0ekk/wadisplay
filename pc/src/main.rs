@@ -228,8 +228,10 @@ struct App {
     key_balance: i64,
     hook_seen: u64,
     balance_since: Option<Instant>,
-    launch: Sender<Config>,
+    launch: Sender<adb::Request>,
     launch_at: Option<Instant>,
+    /// The server we launched; a silent one is relaunched only once it is gone.
+    server_pid: Option<u32>,
     clip: Sender<clip::Cmd>,
     clip_last: clip::Last,
     paused: bool,
@@ -314,10 +316,19 @@ impl App {
             Ev::Tray(m) if m == WM_RBUTTONUP || m == WM_LBUTTONUP => self.menu(),
             Ev::Tray(_) => {}
             Ev::Net(buf) => self.on_net(&buf, now),
-            Ev::Adb(adb::Event::Launched(key)) => {
-                (self.key, self.rx_seq, self.dirty) = (Some(key), 0, true);
+            Ev::Adb(adb::Event::Launched(key, pid)) => {
+                (self.key, self.rx_seq, self.dirty, self.server_pid) = (Some(key), 0, true, Some(pid));
                 let _ = self.clip.send(clip::Cmd::Key(key));
                 self.adb_status = "server started, waiting for its reply".into();
+            }
+            Ev::Adb(adb::Event::Running) => {
+                let s = "tablet server running but not answering (tablet asleep?)";
+                // The check takes a moment: the server may have answered meanwhile.
+                let answering = self.heard.is_some_and(|t| now - t <= Duration::from_secs(3));
+                if !answering && self.adb_status != s {
+                    log!("{s}");
+                    self.adb_status = s.into();
+                }
             }
             Ev::Adb(adb::Event::Failed(e)) => {
                 log!("{e}");
@@ -364,6 +375,7 @@ impl App {
         let Some(Msg::Tab(ts)) = proto::open(&key, proto::DIR_TAB, buf, &mut self.rx_seq) else { return };
         if self.heard.map_or(true, |t| now - t > Duration::from_secs(3)) {
             log!("tablet server answers");
+            self.adb_status = "tablet server not answering".into(); // shown once it goes silent
         }
         let rtt = now_us().saturating_sub(ts.echo_us) as u32;
         self.samples.push_back((rtt, ts.apply_us));
@@ -410,8 +422,14 @@ impl App {
         let silent = self.heard.map_or(true, |t| now - t > Duration::from_secs(3));
         if !self.paused && silent && self.launch_at.map_or(true, |t| now - t > Duration::from_secs(10)) {
             self.launch_at = Some(now);
-            self.adb_status = "connecting over adb".into();
-            let _ = self.launch.send(self.cfg.clone());
+            let cfg = self.cfg.clone();
+            let _ = self.launch.send(match self.server_pid {
+                Some(pid) => adb::Request::Revive(cfg, pid),
+                None => {
+                    self.adb_status = "connecting over adb".into();
+                    adb::Request::Launch(cfg)
+                }
+            });
         }
 
         let every = Duration::from_millis(if self.st.active { 30 } else { 1000 });
@@ -477,7 +495,7 @@ impl App {
                         // The server takes the side at launch (warp corner, strip edge).
                         self.launch_at = Some(Instant::now());
                         self.adb_status = "restarting the tablet server".into();
-                        let _ = self.launch.send(self.cfg.clone());
+                        let _ = self.launch.send(adb::Request::Launch(self.cfg.clone()));
                     }
                 }
             }
@@ -558,7 +576,7 @@ fn run(cfg: Config) {
         cfg: cfg.clone(), hwnd, hider, sock, key: None, tx_seq: 0, rx_seq: 0, st: PcState::default(),
         sw: Switch::new(cfg.side, cfg.push_counts), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None,
         dirty: false, last_send: now, key_balance: 0, hook_seen: capture::HOOK_KEYS.load(Relaxed),
-        balance_since: None, launch, launch_at: None, clip, clip_last, paused: false, tab: None, heard: None,
+        balance_since: None, launch, launch_at: None, server_pid: None, clip, clip_last, paused: false, tab: None, heard: None,
         samples: VecDeque::new(), adb_status: "starting".into(), tip_at: now, stats_at: now, quit: false,
     };
     log!("running");
@@ -585,7 +603,7 @@ fn run(cfg: Config) {
 /// PC send -> uhid write latency (RTT/2 + apply time).
 fn bench(cfg: &Config, secs: u64) {
     let report = (|| -> Result<String, String> {
-        let key = adb::launch(cfg)?;
+        let (key, _) = adb::launch(cfg)?;
         let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
         sock.connect((cfg.tablet_ip.as_str(), proto::PORT)).map_err(|e| e.to_string())?;
         sock.set_nonblocking(true).map_err(|e| e.to_string())?;
