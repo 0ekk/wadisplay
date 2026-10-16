@@ -574,6 +574,15 @@ under "Open checks".
   device and app, so setting the clip from the companion app's uid would not help. Decision: no
   change; README lists it under Limitations. Syncing every PC copy instead of at crossing would
   hide the delay but sends text to a device the user is not on (decision 25), so not done.
+- Follow-up, no Ctrl+V paste in Termius (user report, 2026-10-16): Ctrl+V and Ctrl+Shift+V in
+  the Termius terminal reach the shell as `^V`, both in 7.7.1 shortly before it updated itself and
+  in 7.11.2. Checked: the keys arrive in order (`getevent` on the UHID keyboard), the clip on the
+  tablet is the PC's text, and Ctrl+V in the companion app's test field pastes it. The Huawei IME
+  logs `super.onKeyDown is run` for these keys (its hardware-keyboard handler takes only the
+  language-switch shortcut), and Termius 7.11.2's terminal has no paste key (its hotkeys are
+  Ctrl or Ctrl+Shift with left, right, N, T, W). Its long-press menu's Paste reads the system
+  clipboard (`ClipboardService` logs the read, allowed) and pastes the current text. 7.7.1's earlier
+  stale paste can no longer be examined. Decision: no change; README points to the menu.
 
 ### Private clipboard text toggle (2026-10-16, decision 26)
 - Rationale: password managers mark copies with `ExcludeClipboardContentFromMonitorProcessing` so

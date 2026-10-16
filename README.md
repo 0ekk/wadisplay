@@ -77,8 +77,8 @@ Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each star
   files, no file drag-and-drop, one tablet.
 - A pasted image needs a tablet app that accepts pasted images (chat apps such as Telegram do);
   Huawei Notes, for one, takes only text from the clipboard.
-- Some tablet apps keep their own copy of the clipboard. Termius, for one, pastes the previous text
-  for about 5 seconds after the pointer arrives; other apps get the new text at once.
+- Some tablet apps have no paste shortcut. In the Termius terminal, Ctrl+V reaches the shell as
+  `^V`; paste from its long-press menu instead.
 - Reading the tablet's clipboard shows Android's "Shell read the clipboard." notice each time the
   pointer leaves the tablet after something new was copied there. Only the system-wide clipboard
   privacy setting could hide it, and wadisplay leaves that alone.
