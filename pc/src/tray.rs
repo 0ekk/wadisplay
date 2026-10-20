@@ -1,4 +1,4 @@
-//! Notification-area icon: tooltip status and a menu (tablet side, private clipboard text,
+//! Notification-area icon: tooltip status and a menu (arrange devices, private clipboard text,
 //! Connect/Disconnect, Quit).
 
 use windows::core::{w, HSTRING, PCWSTR};
@@ -8,13 +8,10 @@ use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TI
                                 NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use wadisplay_proto::Side;
-
 pub const WM_TRAY: u32 = WM_APP + 10;
 pub const CMD_CONNECT: u32 = 1;
 pub const CMD_QUIT: u32 = 2;
-pub const CMD_LEFT: u32 = 3;
-pub const CMD_RIGHT: u32 = 4;
+pub const CMD_ARRANGE: u32 = 3;
 pub const CMD_KEEP_PRIVATE: u32 = 5;
 
 /// The tray picture; values are icon group ids in the exe (build.rs).
@@ -66,16 +63,13 @@ pub fn remove(hwnd: HWND) {
 }
 
 /// Shows the menu at the cursor; returns the chosen CMD_* (0 = dismissed).
-pub fn menu(hwnd: HWND, status: &str, connected: bool, side: Side, keep_private: bool) -> u32 {
+pub fn menu(hwnd: HWND, status: &str, connected: bool, keep_private: bool) -> u32 {
     unsafe {
         let Ok(m) = CreatePopupMenu() else { return 0 };
         let status = HSTRING::from(status);
-        let check = |s: Side| if s == side { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, PCWSTR(status.as_ptr()));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(m, MF_STRING | check(Side::Left), CMD_LEFT as usize, w!("Tablet on the left"));
-        let _ = AppendMenuW(m, MF_STRING | check(Side::Right), CMD_RIGHT as usize, w!("Tablet on the right"));
-        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(m, MF_STRING, CMD_ARRANGE as usize, w!("Arrange devices..."));
         let _ = AppendMenuW(m, MF_STRING | if keep_private { MF_CHECKED } else { MF_UNCHECKED },
                             CMD_KEEP_PRIVATE as usize, w!("Keep private clipboard text on this PC"));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);

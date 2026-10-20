@@ -16,7 +16,8 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 - Low latency: about 1.6 ms median, 2.8 ms p99 from PC input to the tablet's input device
   (measured on one home LAN, tablet on Wi-Fi, PC wired).
 - Nothing to install on the tablet by hand: the PC deploys and starts everything over adb.
-- Tray icon that shows where the pointer is.
+- Tray icon that shows where the pointer is, and a window to drag the devices to their edges, like
+  Windows' display arrangement.
 
 ## Requirements
 - **PC:** Windows 11 (64-bit) and [Android platform-tools](https://developer.android.com/tools/releases/platform-tools)
@@ -62,9 +63,11 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
   image; moving back gives the PC the tablet's. Text that password managers mark as private stays on
   the PC unless you uncheck "Keep private clipboard text on this PC" in the tray menu.
   On the tablet, Android then shows "Shell read the clipboard." (once per tablet copy).
-- Tray menu: the current status, "Tablet on the left" / "Tablet on the right" (a TV on that
-  edge swaps to the other), "Keep private clipboard text on this PC", Connect/Disconnect, Quit.
-  Hover the tray icon for latency and hints.
+- Tray menu: the current status, "Arrange devices..." (a window with your monitors and the connected
+  devices around them: drag a device to any edge of the PC and it moves there at once; dropped on
+  the other device's edge, the two swap, even if that one is offline and hidden), "Keep private clipboard text on this PC", Connect/Disconnect, Quit.
+  Hover the tray icon for latency and hints; it lists only the devices that answer (with none,
+  why each one does not).
 
 | Tray icon | Meaning |
 |---|---|
@@ -79,9 +82,9 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 |---|---|---|
 | `tablet_ip` | (none, required) | The tablet's Wi-Fi IP address |
 | `adb` | `adb` | Path to `adb.exe`, or `adb` to find it on `PATH` |
-| `side` | `left` | Where the tablet sits next to the monitor: `left`, `right`, `top`, `bottom` (the tray menu sets left/right) |
+| `side` | `left` | Where the tablet sits next to the monitor: `left`, `right`, `top`, `bottom` (Arrange devices in the tray menu sets it) |
 | `tv_ip` | (none) | A second device's Wi-Fi IP address, such as a TV; leave empty for the tablet alone |
-| `tv_side` | `right` | Where the second device sits; must differ from `side` |
+| `tv_side` | `right` | Where the second device sits; must differ from `side` (Arrange devices sets it too) |
 | `push_counts` | `20` | Raw mouse counts to push past the edge before control crosses |
 | `remote_step` | `200` | Remote mode: raw mouse counts per arrow key press (raise it for a high-DPI mouse) |
 | `private_clipboard` | `keep` | Text that password managers mark private: `keep` it on the PC or `share` it (the tray menu sets this) |

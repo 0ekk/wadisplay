@@ -4,6 +4,7 @@
 //! See docs/plan/2026-10-15-deskdock-clone.md.
 
 mod adb;
+mod arrange;
 mod capture;
 mod clip;
 mod tray;
@@ -52,7 +53,7 @@ pub struct Config {
 }
 
 const DEFAULT_INI: &str = "\
-# wadisplay settings; restart wadisplay.exe after editing. The tray menu also sets side.
+# wadisplay settings; restart wadisplay.exe after editing. The tray menu's Arrange devices also sets side and tv_side.
 # the tablet's Wi-Fi IP address (required)
 tablet_ip=
 # adb.exe path, or adb to find it on PATH
@@ -176,6 +177,8 @@ enum Ev {
     Remote,
     DesktopSwitch,
     Tray(u32),
+    /// The arrange window moved devices: the new side of each, in `App::peers` order.
+    Arrange(Vec<Side>),
     /// These carry the device's index in `App::peers`.
     Net(usize, Vec<u8>),
     Adb(usize, adb::Event),
@@ -415,6 +418,13 @@ impl App {
             Ev::DesktopSwitch => self.release_all("desktop switch"),
             Ev::Tray(m) if m == WM_RBUTTONUP || m == WM_LBUTTONUP => self.menu(),
             Ev::Tray(_) => {}
+            Ev::Arrange(sides) => {
+                for (i, side) in sides.into_iter().enumerate() {
+                    if self.peers[i].cfg.side != side {
+                        self.set_side(i, side);
+                    }
+                }
+            }
             Ev::Net(i, buf) => self.on_net(i, &buf, now),
             Ev::Adb(i, adb::Event::Launched(key, pid)) => {
                 let p = &mut self.peers[i];
@@ -552,6 +562,7 @@ impl App {
             self.tip_at = now + Duration::from_secs(1);
             let (icon, tip) = self.status(now);
             tray::set(self.hwnd, icon, &tip);
+            arrange::update(self.arranged(now));
         }
         if now >= self.stats_at && self.peers.iter().any(|p| !p.samples.is_empty()) {
             self.stats_at = now + Duration::from_secs(60);
@@ -567,28 +578,27 @@ impl App {
         if self.paused {
             return (tray::Icon::Offline, "wadisplay: disconnected".into());
         }
-        // The tooltip holds 127 characters: name the device only when there are two.
-        let two = self.peers.len() > 1;
-        let named = |p: &Peer, s: &str| if two { format!("{}: {s}", p.cfg.name) } else { s.to_string() };
-        if !self.peers.iter().any(|p| p.answering(now)) {
-            let lines: Vec<String> = self.peers.iter().map(|p| named(p, &p.adb_status)).collect();
+        // Only devices that answer are listed; with none, why for each.
+        let online: Vec<&Peer> = self.peers.iter().filter(|p| p.answering(now)).collect();
+        if online.is_empty() {
+            // The tooltip holds 127 characters: name the device only when there are two.
+            let two = self.peers.len() > 1;
+            let lines: Vec<String> = self.peers.iter()
+                .map(|p| if two { format!("{}: {}", p.cfg.name, p.adb_status) } else { p.adb_status.clone() }).collect();
             return (tray::Icon::Offline, format!("wadisplay: {}", lines.join("\n")));
         }
+        let two = online.len() > 1;
         let active = self.peers.iter().find(|p| p.sw.active);
         let (icon, mut s) = match active {
             Some(p) => (tray::Icon::Tablet, format!("wadisplay: {} has control{}", p.cfg.name,
                                                     if p.remote { ", remote mode" } else { "" })),
             None => (tray::Icon::Pc, "wadisplay: PC has control".to_string()),
         };
-        for p in &self.peers {
-            if !p.answering(now) {
-                s += &format!("\n{}", named(p, &p.adb_status));
-                continue;
-            }
+        for p in &online {
             let (p50, p99) = percentiles(p.samples.iter().map(|s| s.0 / 2 + s.1).collect());
             s += &if two { format!("\n{} {p50:.1} ms, p99 {p99:.1}", p.cfg.name) } else { format!("\nlatency {p50:.1} ms, p99 {p99:.1} ms") };
         }
-        for p in self.peers.iter().filter(|p| p.answering(now) && p.tab.is_some_and(|t| !t.screen_on)) {
+        for p in online.iter().filter(|p| p.tab.is_some_and(|t| !t.screen_on)) {
             s += &format!("\n{} screen off: Ctrl+Alt+Space enters", p.cfg.name);
         }
         match active {
@@ -598,6 +608,13 @@ impl App {
             _ => {}
         }
         (icon, s)
+    }
+
+    /// For the arrange window: each device, shown if it answered in the last 10 s (a device that
+    /// was just moved restarts its server within that).
+    fn arranged(&self, now: Instant) -> Vec<(&'static str, Side, bool)> {
+        let shown = |p: &Peer| !self.paused && p.heard.is_some_and(|t| now - t <= Duration::from_secs(10));
+        self.peers.iter().map(|p| (p.cfg.name, p.cfg.side, shown(p))).collect()
     }
 
     fn bye(&mut self, i: usize) {
@@ -621,7 +638,7 @@ impl App {
     fn set_side(&mut self, i: usize, side: Side) {
         self.bye(i);
         let p = &mut self.peers[i];
-        log!("tray: {} on the {}", p.cfg.name, side.name());
+        log!("arrange: {} on the {}", p.cfg.name, side.name());
         p.cfg.side = side;
         p.sw = Switch::new(side, p.cfg.push_counts); // offline until the new server answers
         Config::save(p.cfg.side_key, side.name());
@@ -634,18 +651,8 @@ impl App {
 
     fn menu(&mut self) {
         let status = self.status(Instant::now()).1.replace('\n', " | ");
-        match tray::menu(self.hwnd, &status, !self.paused, self.peers[0].cfg.side, !self.share_private) {
-            cmd @ (tray::CMD_LEFT | tray::CMD_RIGHT) => {
-                let side = if cmd == tray::CMD_LEFT { Side::Left } else { Side::Right };
-                let old = self.peers[0].cfg.side;
-                if side != old {
-                    // A TV on that edge swaps to the tablet's old one.
-                    if let Some(j) = (1..self.peers.len()).find(|&j| self.peers[j].cfg.side == side) {
-                        self.set_side(j, old);
-                    }
-                    self.set_side(0, side);
-                }
-            }
+        match tray::menu(self.hwnd, &status, !self.paused, !self.share_private) {
+            tray::CMD_ARRANGE => arrange::open(self.arranged(Instant::now())),
             tray::CMD_KEEP_PRIVATE => {
                 self.share_private = !self.share_private;
                 let v = if self.share_private { "share" } else { "keep" };

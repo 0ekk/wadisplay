@@ -809,3 +809,50 @@ under "Open checks".
   without warnings. The user, in YouTube on the TV: Ctrl+Alt+R on (log: "TV: remote mode on"),
   focus followed the mouse, left click selected, right click went back, the wheel moved up and
   down, Ctrl+Alt+R off, then edge crossings as before.
+
+### Arrange window (2026-10-21)
+- Request from the user: drag the devices into place on the Windows side, the way Windows arranges
+  displays.
+- Decisions:
+  - Tray item "Arrange devices..." replaces "Tablet on the left/right". It opens a plain Win32
+    window (`pc/src/arrange.rs`, GDI, no new crates; the `windows` crate gains the `Win32_UI_HiDpi`
+    feature for `GetDpiForWindow`): the monitors from `EnumDisplayMonitors`, drawn to scale, and
+    one box per device beside its edge of the virtual desktop.
+  - Dropping a box moves the device to the edge facing the box's center, with the desktop's
+    diagonals as borders (`switch::side_at`). Dropped on the other device's edge, the two swap. The
+    move applies at once through the existing `set_side` (saves `side`/`tv_side`, restarts that
+    server), like the old menu items; no Apply button.
+  - Four edges, all of each: a device still owns the whole edge of the virtual desktop. No offset
+    along the edge, so not "only where the boxes touch" as Windows does for monitors; that would
+    change the crossing and entry/return mapping. Top and bottom, so far reachable only through the
+    ini, are now one drag away.
+  - Both boxes have one fixed size (the PC does not learn the device's screen size). The window
+    owns its copy of the sides: it is the only place sides change while running, and sends
+    `Ev::Arrange` with all of them.
+  - Only devices that answer are shown (the user asked to drop offline or unreachable ones): a
+    device is shown while its server answered in the last 10 s and the tray is not on Disconnect.
+    The 10 s cover the server restart that follows a move, so a dragged box does not vanish for
+    the seconds that takes. `App::tick` refreshes the list each second (`arrange::update`, a no-op
+    while closed or unchanged); a dragged box whose device goes away is dropped. Dropping a box on
+    a hidden device's edge still swaps with it: two devices never share an edge. With none shown,
+    the hint says so.
+  - Likewise the tray tooltip (and the status line atop the tray menu, the same text) lists only
+    devices that answer, and names them only when two answer. With none answering it still gives
+    each device's adb status ("cannot reach ... over adb"), the only hint at the cause outside the
+    log.
+  - The window lives on the main thread (its messages are dispatched by the main loop), state in a
+    `thread_local`; the wndproc never holds that state across `ReleaseCapture`, which sends it
+    `WM_CAPTURECHANGED`. Painting goes through a memory DC so dragging does not flicker.
+- Impact: PC only. `tray::menu` loses its side argument; `CMD_LEFT`/`CMD_RIGHT` become
+  `CMD_ARRANGE`.
+- Verification: `cargo.exe test -p wadisplay-pc` (12, new `arrange_geometry`: diagonal borders,
+  `beside` placement, round trip for all four sides), `cargo.exe check` without warnings.
+  Live, by the user with the tablet and the TV (log): dragging the tablet onto the TV's edge swapped
+  them (`arrange: tablet on the right`, `arrange: TV on the left`), both then entered and returned
+  through their new edges; the TV dragged to the top entered through the top of the desktop and
+  came back through its bottom strip; dragged back, the ini again read `side=left`, `tv_side=right`.
+  The same log had bursts of "keyboard hook missed" while the user only moved the mouse; typing
+  about 20 letters with the arrange window focused, then on the desktop, gave one miss, so the
+  window is not the cause (misses predate it). Open: find what sends those raw key events.
+  With the TV asleep (adb could not reach it) and the tablet awake, the user saw only the tablet in
+  the arrange window and only the tablet's latency line in the tray tooltip.

@@ -66,6 +66,31 @@ pub fn edge_point(side: Side, f: u16, r: Rect) -> (i32, i32) {
     }
 }
 
+/// The side of `r` facing (x, y), with the diagonals of `r` as the borders: where a device dropped
+/// there goes (the arrange window).
+pub fn side_at(x: i32, y: i32, r: Rect) -> Side {
+    let dx = (2 * x - r.l - r.r) as i64 * (r.b - r.t) as i64;
+    let dy = (2 * y - r.t - r.b) as i64 * (r.r - r.l) as i64;
+    match (dx.abs() >= dy.abs(), dx < 0, dy < 0) {
+        (true, true, _) => Side::Left,
+        (true, false, _) => Side::Right,
+        (false, _, true) => Side::Top,
+        (false, _, false) => Side::Bottom,
+    }
+}
+
+/// A `w`×`h` box centered on `side` of `r`, `gap` away from it.
+pub fn beside(side: Side, w: i32, h: i32, gap: i32, r: Rect) -> Rect {
+    let (cx, cy) = ((r.l + r.r - w) / 2, (r.t + r.b - h) / 2);
+    let (l, t) = match side {
+        Side::Left => (r.l - gap - w, cy),
+        Side::Right => (r.r + gap, cy),
+        Side::Top => (cx, r.t - gap - h),
+        Side::Bottom => (cx, r.b + gap),
+    };
+    Rect { l, t, r: l + w, b: t + h }
+}
+
 pub struct Switch {
     pub side: Side,
     pub push_counts: i32,
@@ -174,6 +199,21 @@ mod tests {
         assert_eq!(distance(Side::Right, 100, 700, R), 2459);
         assert_eq!(distance(Side::Top, 0, 1439, R), 1439);
         assert_eq!(distance(Side::Bottom, 0, 1439, R), 0);
+    }
+
+    #[test]
+    fn arrange_geometry() {
+        // The diagonals split the sides: below the left part is still the bottom.
+        assert_eq!(side_at(100, 1500, R), Side::Bottom);
+        assert_eq!(side_at(-100, 720, R), Side::Left);
+        assert_eq!(side_at(2600, 100, R), Side::Right);
+        assert_eq!(side_at(1280, -50, R), Side::Top);
+        let b = beside(Side::Left, 800, 500, 100, R);
+        assert_eq!((b.l, b.t, b.r, b.b), (-900, 470, -100, 970));
+        for s in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
+            let b = beside(s, 800, 500, 100, R);
+            assert_eq!(side_at((b.l + b.r) / 2, (b.t + b.b) / 2, R), s);
+        }
     }
 
     #[test]

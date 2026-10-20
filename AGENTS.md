@@ -10,7 +10,7 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
   NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts and the clipboard relay
   (TCP to the PC, pipes to the helper) (`main.rs`).
 - `pc/`: `wadisplay.exe` (Windows, elevated via manifest). Hooks/Raw Input/cursor parking (`capture.rs`),
-  adb deploy/launch (`adb.rs`), tray (`tray.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`, `remote.rs`) and the
+  adb deploy/launch (`adb.rs`), tray (`tray.rs`), arrange window (`arrange.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`, `remote.rs`) and the
   WIC image conversions (`image.rs`) are the lib, so
   tests never link the requireAdministrator manifest. `build.rs` links the manifest and `icon/*.png`
   (as a hand-written `.res`) into the exe.
@@ -57,7 +57,7 @@ Windows `adb.exe` reads stdin in text mode (byte 0x1A ends it) and turns LF into
 - Start `wadisplay.exe` (UAC prompt every start). Settings and log live in `%LOCALAPPDATA%\wadisplay\`
   (`wadisplay.ini`, created with defaults on first start, which then asks for `tablet_ip`;
   `wadisplay.log`, rewritten each start). The tray menu
-  switches the tablet between left and right and whether private clipboard text stays on the PC. It connects adb to `tablet_ip:5555`, and to `tv_ip:5555` for an optional second device on another edge (running
+  opens the arrange window (drag each device to an edge) and sets whether private clipboard text stays on the PC. It connects adb to `tablet_ip:5555`, and to `tv_ip:5555` for an optional second device on another edge (running
   `adb tcpip 5555` if the tablet is on USB), deploys the server/APK when their hashes change and
   launches the server.
 - Latency bench: `wadisplay.exe --bench [seconds]` (default 60; result in a message box and the log).
