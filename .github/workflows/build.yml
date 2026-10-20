@@ -22,12 +22,14 @@ jobs:
       - name: Install NDK and Rust target
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;29.0.14206865" > /dev/null
-          rustup target add aarch64-linux-android
+          rustup target add aarch64-linux-android armv7-linux-androideabi
       - name: Build wadisplay-server
         # The cargo-ndk equivalent of the local build: NDK r29 clang, API 21 (cargo-ndk's default).
         run: |
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-          cargo build --release --locked -p wadisplay-server --target aarch64-linux-android
+          bin="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android21-clang"
+          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$bin/armv7a-linux-androideabi21-clang"
+          cargo build --release --locked -p wadisplay-server --target aarch64-linux-android --target armv7-linux-androideabi
       - name: Build APK
         run: |
           echo "2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046  android/gradle/wrapper/gradle-wrapper.jar" | sha256sum -c
@@ -38,6 +40,7 @@ jobs:
           name: android
           path: |
             target/aarch64-linux-android/release/wadisplay-server
+            target/armv7-linux-androideabi/release/wadisplay-server
             android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 

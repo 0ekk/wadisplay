@@ -11,8 +11,11 @@ use wadisplay_proto::hex;
 
 use crate::{log, Config};
 
-static SERVER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
-                                              "/../target/aarch64-linux-android/release/wadisplay-server"));
+static SERVER_ARM64: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
+                                                    "/../target/aarch64-linux-android/release/wadisplay-server"));
+/// For 32-bit-only Android (TVs: `ro.product.cpu.abi` armeabi-v7a, no 64-bit userspace).
+static SERVER_ARM32: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
+                                                    "/../target/armv7-linux-androideabi/release/wadisplay-server"));
 static APK: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
                                            "/../android/app/build/outputs/apk/debug/app-debug.apk"));
 const PKG: &str = "com.wadisplay.companion";
@@ -115,13 +118,21 @@ impl Adb<'_> {
 
     fn deploy(&self) -> Result<(), String> {
         let server = format!("{DIR}/wadisplay-server");
-        self.ensure("wadisplay-server", SERVER, |tmp| {
+        let bin = match self.shell("getprop ro.product.cpu.abi")?.as_str() {
+            "arm64-v8a" => SERVER_ARM64,
+            abi if abi.starts_with("armeabi") => SERVER_ARM32,
+            abi => return Err(format!("{}: unsupported CPU ABI {abi}", self.serial)),
+        };
+        self.ensure("wadisplay-server", bin, |tmp| {
             // A running server keeps its old inode: push beside it and rename over it.
             self.run(&["-s", &self.serial, "push", tmp, &format!("{server}.new")])?;
             self.shell(&format!("chmod 755 {server}.new && mv -f {server}.new {server}")).map(drop)
         }, self.shell(&format!("ls {server}")).is_ok())?;
         let installed = self.shell(&format!("pm path {PKG}")).is_ok_and(|s| s.contains("package:"));
         self.ensure("wadisplay-companion.apk", APK, |tmp| {
+            // HarmonyOS TVs show a risk notice first (Continue install / Cancel), behind the
+            // screensaver if it runs; adb waits until someone answers it.
+            log!("installing the companion app on {}: confirm on its screen if it asks", self.serial);
             if self.run(&["-s", &self.serial, "install", "-r", tmp]).is_err() {
                 // e.g. signed with another debug key: start over.
                 let _ = self.run(&["-s", &self.serial, "uninstall", PKG]);

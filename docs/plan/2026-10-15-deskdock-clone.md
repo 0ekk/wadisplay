@@ -704,3 +704,40 @@ under "Open checks".
   `am stopservice` left the app dead until unlock, and an accidental edge entry woke the tablet;
   (3) everything above: one server, app and helper throughout, one thaw failure logged, the edge
   back in use right after unlock, entry and return working.
+
+### 32-bit Android TVs (2026-10-21)
+- Question from the user: can the tablet side also run on a TV (a Huawei smart screen, HarmonyOS 2,
+  on the same LAN, network adb already on)?
+- Findings (adb, read-only, then a live UHID test):
+  - Android 10 (API 29), landscape 16:9, `ro.product.cpu.abilist` armeabi-v7a only,
+    `zygote32`, no `/system/bin/linker64` (the CPU is ARMv8; `uname -m` says armv8l). The aarch64
+    server cannot start there.
+  - Everything else the tablet relies on is present: shell is in group `uhid`, `/dev/uhid` opens
+    read/write under SELinux, shell holds INJECT_EVENTS, READ_CLIPBOARD_IN_BACKGROUND,
+    MANAGE_APP_OPS_MODES and DUMP, `app_process32` exists, and API 29 equals the APK's minSdk.
+    Network adb comes back by itself after a reboot (unlike the tablet's `adb tcpip`).
+  - A UHID mouse with our descriptor (`hid` tool) registers as SOURCE_MOUSE in pointer mode, and
+    the native pointer is drawn: SurfaceFlinger's `Sprite#0` layer moved about 700 px in 1.5 s
+    of reports. This TV's `screencap` leaves the pointer out (the tablet's includes it),
+    so pointer checks here read the `Sprite#0` position from `dumpsys SurfaceFlinger` instead.
+  - `adb install` blocks on a HarmonyOS "risk notice" (unknown source: Continue install / Cancel)
+    until someone answers it on the TV; the screensaver hides it until a key wakes the screen.
+- Decisions:
+  - Build the server for `armv7-linux-androideabi` too (cargo-ndk `-t armeabi-v7a`; CI links with
+    the NDK's `armv7a-linux-androideabi21-clang`, byte-identical to the cargo-ndk build here). No
+    source change: the server builds its wire and uhid structs byte by byte.
+  - The exe embeds both binaries and picks one per device from `getprop ro.product.cpu.abi`:
+    arm64-v8a gets aarch64, armeabi* gets armv7, anything else fails with a clear message. The
+    existing hash file keeps working, since the hash is of the binary pushed.
+  - The adb thread logs before `adb install` that the device may ask on screen; README says how to
+    answer the notice. No timeout: the install finishes whenever the notice is answered.
+- Impact: the exe grows by the 32-bit server (about 370 KB). Arm64 tablets get the same binary as
+  before. CI uploads both server builds in the `android` artifact.
+- Verification: `cargo test` (proto 5, server 10) and `cargo.exe test -p wadisplay-pc` (8) pass,
+  release builds of the server (both targets) and the exe succeed. On the TV, with the
+  armv7 server pushed and the APK installed by hand (the user answered the risk notice) and a
+  throwaway UDP client in place of the exe: uhid mouse and keyboard opened, gain 1.000
+  (`pointer_speed` 0), clipboard helper started, EdgeService reported the display size with the
+  strip visible, the entry warp to the middle of the edge landed with 0.05% error, a push out of the left edge
+  returned `return_y` 32798, RTT 2.5 to 8 ms, and `Bye` exited cleanly. Running the tablet and the
+  TV from one exe is the next section.

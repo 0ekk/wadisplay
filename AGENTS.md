@@ -6,7 +6,7 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
 
 ## Layout
 - `proto/`: wire format shared by both sides (`PcState`, `TabState`, ChaCha20-Poly1305 `seal`/`open`, `Side`).
-- `server/`: `wadisplay-server`, Rust aarch64 Android binary run as the adb shell uid. UHID mouse +
+- `server/`: `wadisplay-server`, Rust Android binary (aarch64, plus armv7 for 32-bit TVs) run as the adb shell uid. UHID mouse +
   NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts and the clipboard relay
   (TCP to the PC, pipes to the helper) (`main.rs`).
 - `pc/`: `wadisplay.exe` (Windows, elevated via manifest). Hooks/Raw Input/cursor parking (`capture.rs`),
@@ -21,7 +21,7 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
 ## Build (in WSL; order matters, the exe embeds the server binary and the APK)
 ```sh
 export ANDROID_HOME=~/android-sdk ANDROID_NDK_HOME=~/android-sdk/ndk/29.0.14206865
-cargo ndk -t arm64-v8a build --release -p wadisplay-server
+cargo ndk -t arm64-v8a -t armeabi-v7a build --release -p wadisplay-server
 (cd android && ./gradlew -q assembleDebug)
 cargo.exe build --release -p wadisplay-pc --target-dir 'C:\wadisplay-target'
 ```
@@ -30,7 +30,7 @@ The exe is `C:\wadisplay-target\release\wadisplay.exe`. Always pass `--target-di
 
 CI: `.github/workflows/build.yml` runs the same build on GitHub (job `android` on Linux: server + APK,
 artifact `android`; job `windows`: the exe, artifact `wadisplay-exe`). It links the server with the
-NDK's `aarch64-linux-android21-clang` instead of cargo-ndk (byte-identical on the same machine; CI
+NDK's `aarch64-linux-android21-clang` / `armv7a-linux-androideabi21-clang` instead of cargo-ndk (byte-identical on the same machine; CI
 binaries differ only in the `~/.cargo` path inside panic messages); keep the NDK version in both
 places in step. Actions are pinned to full commit SHAs of releases at least 14 days
 old; bump them the same way.

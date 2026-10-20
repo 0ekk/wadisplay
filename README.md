@@ -19,9 +19,10 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 ## Requirements
 - **PC:** Windows 11 (64-bit) and [Android platform-tools](https://developer.android.com/tools/releases/platform-tools)
   (`adb`). Tested on Windows 11; Windows 10 is untested.
-- **Tablet:** arm64, Android 10 or newer (the APK's minimum; only Android 12 is tested), Developer
-  options with USB debugging on, same LAN as the PC. Tested on a Huawei tablet with HarmonyOS 4
-  (Android 12 base).
+- **Tablet:** arm64 or 32-bit ARM (armeabi-v7a, as on many TVs), Android 10 or newer (the APK's
+  minimum), Developer options with USB debugging on, same LAN as the PC. Tested on a Huawei tablet
+  with HarmonyOS 4 (Android 12 base) and a Huawei smart screen TV with HarmonyOS 2 (Android 10
+  base, 32-bit).
 - A USB cable for the first connection and once after every tablet reboot (see Limitations).
 
 ## Quick start
@@ -92,6 +93,9 @@ Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each star
   asleep"; it costs battery, since wadisplay's once-a-second heartbeat keeps the tablet awake.
 - `adb tcpip` does not survive a tablet reboot: plug in USB once after each reboot and wadisplay
   re-enables it by itself.
+- HarmonyOS TVs show a risk notice before the companion app installs (first start, and after an
+  update changes the app); answer "Continue install" with the remote. wadisplay waits until then. The
+  screensaver can hide the notice: press a key on the remote first.
 - A UAC prompt at every start: the exe runs elevated so that it also sees input aimed at elevated
   windows such as Task Manager.
 - Some input methods (Huawei's, for example) show a toolbar while a hardware keyboard is present.
