@@ -10,7 +10,7 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
   NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts and the clipboard relay
   (TCP to the PC, pipes to the helper) (`main.rs`).
 - `pc/`: `wadisplay.exe` (Windows, elevated via manifest). Hooks/Raw Input/cursor parking (`capture.rs`),
-  adb deploy/launch (`adb.rs`), tray (`tray.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`) and the
+  adb deploy/launch (`adb.rs`), tray (`tray.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`, `remote.rs`) and the
   WIC image conversions (`image.rs`) are the lib, so
   tests never link the requireAdministrator manifest. `build.rs` links the manifest and `icon/*.png`
   (as a hand-written `.res`) into the exe.

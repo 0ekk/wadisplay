@@ -2,7 +2,7 @@
 //! has control (mouse moves pass: Raw Input supplies the counts and ClipCursor pins the
 //! cursor). Hook callbacks only decide, post a message to the main window and return.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -24,6 +24,7 @@ pub const WM_BUTTON_TAB: u32 = WM_APP + 2;
 pub const WM_WHEEL_TAB: u32 = WM_APP + 3;
 pub const WM_TOGGLE: u32 = WM_APP + 4;
 const WM_REHOOK: u32 = WM_APP + 5;
+pub const WM_REMOTE: u32 = WM_APP + 6;
 
 /// The tablet has control.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -36,7 +37,10 @@ static DOWN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 static TO_TAB: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 static BTN_DOWN: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
 static BTN_TO_TAB: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
-static HOTKEY_SPACE: AtomicBool = AtomicBool::new(false);
+/// Usage of the Ctrl+Alt hotkey held down now (0: none).
+static HOTKEY: AtomicU8 = AtomicU8::new(0);
+/// Ctrl+Alt+<usage>: message, and whether it counts only while the tablet has control.
+const HOTKEYS: [(u8, u32, bool); 2] = [(0x2C, WM_TOGGLE, false), (0x15, WM_REMOTE, true)]; // Space, R
 
 fn post(msg: u32, wp: usize, lp: isize) {
     let hwnd = HWND(MAIN.load(Relaxed) as *mut _);
@@ -45,20 +49,22 @@ fn post(msg: u32, wp: usize, lp: isize) {
 
 /// Key-owner routing: a release goes wherever its press went. Returns "swallow".
 fn on_key(u: u8, down: bool) -> bool {
-    const SPACE: u8 = 0x2C;
     if u == 0 {
         return ACTIVE.load(Relaxed); // unmapped (incl. fake shifts): never leak while active
     }
     let held = |a: u8, b: u8| DOWN[a as usize].load(Relaxed) || DOWN[b as usize].load(Relaxed);
-    if u == SPACE && (HOTKEY_SPACE.load(Relaxed) || down && held(0xE0, 0xE4) && held(0xE2, 0xE6)) {
-        // Ctrl+Alt+Space is PC-local: never forwarded, its Space never reaches the PC either.
-        if down && !HOTKEY_SPACE.swap(true, Relaxed) {
-            post(WM_TOGGLE, 0, 0);
+    if let Some(&(_, msg, active_only)) = HOTKEYS.iter().find(|h| h.0 == u) {
+        let ctrl_alt = held(0xE0, 0xE4) && held(0xE2, 0xE6);
+        if HOTKEY.load(Relaxed) == u || down && ctrl_alt && (!active_only || ACTIVE.load(Relaxed)) {
+            // A hotkey is PC-local: never forwarded, and its key never reaches the PC either.
+            if down && HOTKEY.swap(u, Relaxed) != u {
+                post(msg, 0, 0);
+            }
+            if !down {
+                HOTKEY.store(0, Relaxed);
+            }
+            return true;
         }
-        if !down {
-            HOTKEY_SPACE.store(false, Relaxed);
-        }
-        return true;
     }
     route(&DOWN[u as usize], &TO_TAB[u as usize], down, || post(WM_KEY_TAB, u as usize, down as isize))
 }
@@ -154,7 +160,7 @@ pub fn reset_owners() {
     for a in DOWN.iter().chain(&TO_TAB).chain(&BTN_DOWN).chain(&BTN_TO_TAB) {
         a.store(false, Relaxed);
     }
-    HOTKEY_SPACE.store(false, Relaxed);
+    HOTKEY.store(0, Relaxed);
 }
 
 /// A mouse button is held on the PC side (blocks crossing, e.g. while dragging to Snap).

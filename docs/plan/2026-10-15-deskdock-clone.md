@@ -773,3 +773,39 @@ under "Open checks".
   on its entry; the hotkey entered the TV with the cursor on the right half and the tablet with it
   on the left half, and returned to the PC from each. The TV kept the companion app it already had
   (hash files matched), so no second install notice.
+
+### TV apps that ignore the mouse: remote mode (2026-10-21)
+- Report from the user: on the TV, clicks do nothing and typing does not go in, in Huawei's own
+  apps and in video apps.
+- Findings (adb; injected UHID clicks and keys, then the user's own attempt recorded with
+  per-device `getevent` and `uiautomator events`):
+  - Input arrives: the user's 12 clicks reached the server's mouse device as clean press/release
+    pairs, and the keys reached the keyboard device.
+  - Clicks work where an app has clickable views: the Huawei launcher (`VIEW_CLICKED`), its search
+    page's letter grid, Huawei Video posters, the sidebar of a Tencent TV app.
+  - YouTube on Android TV draws its own UI: accessibility sees one bare `View`, and clicks
+    produce nothing. Keyboard arrows, Enter and Esc (Back through Generic.kcm's fallback) work
+    there (the user checked).
+  - TV search pages (the Huawei launcher's, most video apps') have no text field, only their own
+    letter grid; hardware letters are ignored (a `B` key changed nothing). A real text field
+    works through the Baidu TV input method, with its candidate bar shown both with
+    `show_ime_with_hard_keyboard` 1 and 0.
+- Decisions:
+  - Remote mode, toggled by Ctrl+Alt+R for the device in control (the hotkey counts only while a
+    device has control, so PC apps keep Ctrl+Alt+R). Mouse motion presses arrow keys, one per
+    `remote_step` raw counts (default 200, an ini setting because mouse DPI varies) along the
+    dominant axis; left click Enter, right click Esc, wheel Up/Down (tilt Left/Right). These are
+    the keys already shown to work, so the server, the wire format and the HID descriptors stay as
+    they are.
+  - Pure logic in `pc/src/remote.rs`: a queue of presses (at most 4, so a flick does not keep
+    moving), each held 40 ms (two 30 ms state packets carry it) and followed by a 40 ms gap.
+    Leaving the device or toggling drops the queue and releases the key.
+  - The flag is per device and lasts until toggled or the exe restarts. In remote mode the pointer
+    stands still, so the edge return cannot trigger; the tooltip names the mode and the hotkeys.
+  - Not done: typing into apps' own letter grids (no generic way in), and guessing per app when to
+    switch modes.
+- Impact: PC only. Ctrl+Alt+R is swallowed while a device has control. New `remote_step` setting.
+- Verification: `cargo.exe test -p wadisplay-pc` (11, three new for `remote.rs`), release build
+  without warnings. The user, in YouTube on the TV: Ctrl+Alt+R on (log: "TV: remote mode on"),
+  focus followed the mouse, left click selected, right click went back, the wheel moved up and
+  down, Ctrl+Alt+R off, then edge crossings as before.

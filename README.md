@@ -10,6 +10,7 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 ## Features
 - Edge crossing in both directions, plus a hotkey (`Ctrl+Alt+Space`) to switch at any time.
 - Optionally a second device on another edge at the same time, such as a TV.
+- Remote mode for apps that only take a TV remote: the mouse drives the D-pad.
 - Keyboard follows the pointer; the tablet's input method composes Chinese and other languages.
 - Shared clipboard (text and images): copy on one device, move the pointer over, paste.
 - Low latency: about 1.6 ms median, 2.8 ms p99 from PC input to the tablet's input device
@@ -47,6 +48,13 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
   PC from either.
 - A second device (`tv_ip`, `tv_side`) works the same way from its own edge; each has its own
   server and companion app.
+- Some TV apps ignore the mouse and hardware letters: YouTube on Android TV draws its own UI, and
+  TV search pages offer only their own on-screen letter grid. The keyboard's arrows, Enter and Esc
+  (Back) work there. `Ctrl+Alt+R` (while the device has control) turns on remote mode for that
+  device: moving the mouse presses arrow keys (one per `remote_step` counts), left click is Enter,
+  right click is Esc, the wheel is Up/Down. The pointer stays put, so return with
+  `Ctrl+Alt+Space`; `Ctrl+Alt+R` again gives the pointer back. The mode stays on for that device
+  until then (not across restarts).
 - Crossing is suppressed while a mouse button is held (so dragging a window to the edge for Snap
   stays on the PC), while a fullscreen app such as a game is in front, and while another app
   confines the cursor. The hotkey still works in all three cases.
@@ -75,6 +83,7 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 | `tv_ip` | (none) | A second device's Wi-Fi IP address, such as a TV; leave empty for the tablet alone |
 | `tv_side` | `right` | Where the second device sits; must differ from `side` |
 | `push_counts` | `20` | Raw mouse counts to push past the edge before control crosses |
+| `remote_step` | `200` | Remote mode: raw mouse counts per arrow key press (raise it for a high-DPI mouse) |
 | `private_clipboard` | `keep` | Text that password managers mark private: `keep` it on the PC or `share` it (the tray menu sets this) |
 
 Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each start) and

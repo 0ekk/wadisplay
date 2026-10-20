@@ -2,6 +2,7 @@
 #[cfg(windows)]
 pub mod image;
 pub mod keymap;
+pub mod remote;
 pub mod switch;
 
 /// `text` (an .ini file) with `key=value` replacing that key's line, or appended if absent.

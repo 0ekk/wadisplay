@@ -30,10 +30,11 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use capture::Raw;
+use wadisplay_pc::remote::Remote;
 use wadisplay_pc::switch::{self, Action, Rect, Switch};
 
-/// One device's settings (the tablet's, or the TV's); `adb`, `push_counts` and `share_private`
-/// are shared.
+/// One device's settings (the tablet's, or the TV's); `adb`, `push_counts`, `remote_step` and
+/// `share_private` are shared.
 #[derive(Clone)]
 pub struct Config {
     /// "tablet" or "TV", for logs and the tray.
@@ -44,6 +45,8 @@ pub struct Config {
     pub adb: String,
     pub side: Side,
     pub push_counts: i32,
+    /// Remote mode: raw mouse counts per arrow key press.
+    pub remote_step: i32,
     /// Share clipboard text that its app marked private (password managers); off by default.
     pub share_private: bool,
 }
@@ -62,6 +65,8 @@ tv_ip=
 tv_side=right
 # raw mouse counts to push past the edge before control crosses over
 push_counts=20
+# remote mode (Ctrl+Alt+R, for apps that only take a TV remote): raw mouse counts per arrow key press
+remote_step=200
 # clipboard text that password managers mark private: keep (on this PC) or share. The tray menu also sets it.
 private_clipboard=keep
 ";
@@ -79,7 +84,7 @@ impl Config {
             DEFAULT_INI.into()
         });
         let mut c = Config { name: "tablet", side_key: "side", ip: String::new(), adb: "adb".into(), side: Side::Left,
-                             push_counts: 20, share_private: false };
+                             push_counts: 20, remote_step: 200, share_private: false };
         let (mut tv_ip, mut tv_side) = (String::new(), Side::Right);
         for line in text.lines().filter(|l| !l.trim_start().starts_with(['#', ';'])) {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -91,12 +96,13 @@ impl Config {
                 "tv_ip" => tv_ip = v.into(),
                 "tv_side" => tv_side = Side::parse(v).unwrap_or(tv_side),
                 "push_counts" => c.push_counts = v.parse().unwrap_or(c.push_counts),
+                "remote_step" => c.remote_step = v.parse().unwrap_or(c.remote_step),
                 "private_clipboard" => c.share_private = v == "share",
                 k => log!("wadisplay.ini: unknown key {k}"),
             }
         }
-        log!("config {}: push {} adb {} private clipboard {}", path.display(), c.push_counts, c.adb,
-             if c.share_private { "share" } else { "keep" });
+        log!("config {}: push {} remote step {} adb {} private clipboard {}", path.display(), c.push_counts,
+             c.remote_step, c.adb, if c.share_private { "share" } else { "keep" });
         let mut v = vec![c.clone()];
         if !tv_ip.is_empty() {
             v.push(Config { name: "TV", side_key: "tv_side", ip: tv_ip, side: tv_side, ..c });
@@ -166,6 +172,8 @@ enum Ev {
     Button(u8, bool),
     Wheel(bool, i32),
     Toggle,
+    /// Ctrl+Alt+R: remote mode on/off for the device in control.
+    Remote,
     DesktopSwitch,
     Tray(u32),
     /// These carry the device's index in `App::peers`.
@@ -205,6 +213,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         capture::WM_BUTTON_TAB => emit(Ev::Button(wp.0 as u8, on)),
         capture::WM_WHEEL_TAB => emit(Ev::Wheel(wp.0 != 0, lp.0 as i32)),
         capture::WM_TOGGLE => emit(Ev::Toggle),
+        capture::WM_REMOTE => emit(Ev::Remote),
         tray::WM_TRAY => emit(Ev::Tray(lp.0 as u32)),
         _ => return DefWindowProcW(h, msg, wp, lp),
     }
@@ -250,6 +259,8 @@ struct Peer {
     /// (rtt us, apply us) of recent replies.
     samples: VecDeque<(u32, u32)>,
     adb_status: String,
+    /// Remote mode: mouse input becomes D-pad keys while this device has control.
+    remote: bool,
 }
 
 impl Peer {
@@ -271,6 +282,7 @@ struct App {
     peers: Vec<Peer>,
     /// Input state; each device gets it with `active` set only for the one in control.
     st: PcState,
+    remote: Remote,
     /// While parked: our 1 px clip, and another app's confinement to restore afterwards.
     park: Option<(RECT, Option<RECT>)>,
     /// Edge crossing is off (fullscreen app in front or cursor confined), checked every 250 ms.
@@ -297,6 +309,11 @@ impl App {
         }
     }
 
+    /// The device in control is in remote mode.
+    fn in_remote(&self) -> bool {
+        self.peers.iter().any(|p| p.sw.active && p.remote)
+    }
+
     fn on(&mut self, ev: Ev, now: Instant) {
         match ev {
             Ev::Mouse(x, y, absolute) => {
@@ -315,9 +332,13 @@ impl App {
                     return;
                 }
                 if self.st.active {
-                    self.st.x = self.st.x.wrapping_add(dx);
-                    self.st.y = self.st.y.wrapping_add(dy);
-                    self.touch();
+                    if self.in_remote() {
+                        self.remote.motion(dx, dy);
+                    } else {
+                        self.st.x = self.st.x.wrapping_add(dx);
+                        self.st.y = self.st.y.wrapping_add(dy);
+                        self.touch();
+                    }
                     if let Some((r, _)) = &self.park {
                         capture::keep_parked(r);
                     }
@@ -349,6 +370,7 @@ impl App {
                 set_bit(&mut self.st.keys, u, down);
                 self.touch();
             }
+            Ev::Button(b, down) if self.in_remote() => self.remote.button(b, down),
             Ev::Button(b, down) => {
                 if down { self.st.buttons |= 1 << b } else { self.st.buttons &= !(1 << b) }
                 self.touch();
@@ -358,11 +380,25 @@ impl App {
                 *acc += delta;
                 let n = *acc / 120;
                 *acc -= n * 120;
+                if self.in_remote() {
+                    self.remote.wheel(horizontal, n);
+                    return;
+                }
                 let total = if horizontal { &mut self.st.hwheel } else { &mut self.st.wheel };
                 *total = total.wrapping_add(n);
                 if n != 0 {
                     self.touch();
                 }
+            }
+            Ev::Remote => {
+                let Some(p) = self.peers.iter_mut().find(|p| p.sw.active) else { return };
+                p.remote = !p.remote;
+                log!("{}: remote mode {}", p.cfg.name, if p.remote { "on" } else { "off" });
+                // Nothing pressed carries over between the modes.
+                p.dirty = true;
+                self.remote.stop(&mut self.st.keys);
+                self.st.buttons = 0;
+                self.tip_at = now;
             }
             Ev::Toggle => {
                 // Back to the PC, or into the connected device whose edge is nearest the cursor.
@@ -419,6 +455,7 @@ impl App {
             }
             Action::Leave(to) => {
                 self.st.active = false;
+                self.remote.stop(&mut self.st.keys);
                 capture::ACTIVE.store(false, Relaxed);
                 let prev = self.park.take().and_then(|p| p.1);
                 capture::unpark(self.hider, prev, to.map(|f| switch::edge_point(side, f, screen())));
@@ -486,6 +523,9 @@ impl App {
             (self.key_balance, self.balance_since) = (0, None);
         }
 
+        if self.remote.tick(now_ms(), &mut self.st.keys) {
+            self.touch();
+        }
         for p in &mut self.peers {
             let silent = p.heard.map_or(true, |t| now - t > Duration::from_secs(3));
             if !self.paused && silent && p.launch_at.map_or(true, |t| now - t > Duration::from_secs(10)) {
@@ -536,7 +576,8 @@ impl App {
         }
         let active = self.peers.iter().find(|p| p.sw.active);
         let (icon, mut s) = match active {
-            Some(p) => (tray::Icon::Tablet, format!("wadisplay: {} has control", p.cfg.name)),
+            Some(p) => (tray::Icon::Tablet, format!("wadisplay: {} has control{}", p.cfg.name,
+                                                    if p.remote { ", remote mode" } else { "" })),
             None => (tray::Icon::Pc, "wadisplay: PC has control".to_string()),
         };
         for p in &self.peers {
@@ -551,6 +592,7 @@ impl App {
             s += &format!("\n{} screen off: Ctrl+Alt+Space enters", p.cfg.name);
         }
         match active {
+            Some(p) if p.remote => s += "\nCtrl+Alt+R: pointer; Ctrl+Alt+Space: back to PC",
             Some(p) if p.tab.is_some_and(|t| t.screen_on && !t.strip_visible) => s += "\nedge return off here: Ctrl+Alt+Space",
             None if self.blocked => s += "\nfullscreen app: edges off, Ctrl+Alt+Space",
             _ => {}
@@ -664,7 +706,7 @@ fn run(devices: Vec<Config>) {
     tray::add(hwnd, tray::Icon::Offline, "wadisplay: starting");
 
     let now = Instant::now();
-    let share_private = devices[0].share_private;
+    let (share_private, remote_step) = (devices[0].share_private, devices[0].remote_step);
     // Per device: a socket and its reader, an adb thread (a slow or prompting device holds up
     // only itself) and a clipboard thread.
     let peers = devices.into_iter().enumerate().map(|(i, cfg)| {
@@ -690,11 +732,11 @@ fn run(devices: Vec<Config>) {
         std::thread::spawn(move || clip::thread(name, ip, clip_rx, last, share_private, move |c| emit_wake(Ev::Clip(i, c))));
         Peer { sw: Switch::new(cfg.side, cfg.push_counts), cfg, sock, key: None, tx_seq: 0, rx_seq: 0, dirty: false,
                last_send: now, launch, launch_at: None, server_pid: None, clip, clip_last, tab: None, heard: None,
-               samples: VecDeque::new(), adb_status: "starting".into() }
+               samples: VecDeque::new(), adb_status: "starting".into(), remote: false }
     }).collect();
 
     let mut app = App {
-        hwnd, hider, peers, st: PcState::default(), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2],
+        hwnd, hider, peers, st: PcState::default(), remote: Remote::new(remote_step), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2],
         abs_prev: None, key_balance: 0, hook_seen: capture::HOOK_KEYS.load(Relaxed), balance_since: None,
         share_private, paused: false, tip_at: now, stats_at: now, quit: false,
     };
