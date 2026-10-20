@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
-//! wadisplay: share this PC's mouse and keyboard with an Android tablet over the LAN.
+//! wadisplay: share this PC's mouse and keyboard with an Android tablet (and a TV on another
+//! edge) over the LAN.
 //! See docs/plan/2026-10-15-deskdock-clone.md.
 
 mod adb;
@@ -31,9 +32,15 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use capture::Raw;
 use wadisplay_pc::switch::{self, Action, Rect, Switch};
 
+/// One device's settings (the tablet's, or the TV's); `adb`, `push_counts` and `share_private`
+/// are shared.
 #[derive(Clone)]
 pub struct Config {
-    pub tablet_ip: String,
+    /// "tablet" or "TV", for logs and the tray.
+    pub name: &'static str,
+    /// The ini key holding `side`.
+    pub side_key: &'static str,
+    pub ip: String,
     pub adb: String,
     pub side: Side,
     pub push_counts: i32,
@@ -48,7 +55,11 @@ tablet_ip=
 # adb.exe path, or adb to find it on PATH
 adb=adb
 # where the tablet sits relative to the monitor: left, right, top or bottom
-side=right
+side=left
+# a second device on another edge at the same time (a TV, say): its Wi-Fi IP address, or empty
+tv_ip=
+# where the second device sits: left, right, top or bottom, not the tablet's side
+tv_side=right
 # raw mouse counts to push past the edge before control crosses over
 push_counts=20
 # clipboard text that password managers mark private: keep (on this PC) or share. The tray menu also sets it.
@@ -60,29 +71,40 @@ impl Config {
         data_dir().join("wadisplay.ini")
     }
 
-    fn load() -> Config {
+    /// The tablet, then the TV if `tv_ip` is set.
+    fn load() -> Vec<Config> {
         let path = Config::path();
         let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
             let _ = std::fs::write(&path, DEFAULT_INI);
             DEFAULT_INI.into()
         });
-        let mut c = Config { tablet_ip: String::new(), adb: "adb".into(), side: Side::Right, push_counts: 20,
-                            share_private: false };
+        let mut c = Config { name: "tablet", side_key: "side", ip: String::new(), adb: "adb".into(), side: Side::Left,
+                             push_counts: 20, share_private: false };
+        let (mut tv_ip, mut tv_side) = (String::new(), Side::Right);
         for line in text.lines().filter(|l| !l.trim_start().starts_with(['#', ';'])) {
             let Some((k, v)) = line.split_once('=') else { continue };
             let v = v.trim();
             match k.trim() {
-                "tablet_ip" => c.tablet_ip = v.into(),
+                "tablet_ip" => c.ip = v.into(),
                 "adb" => c.adb = v.into(),
                 "side" => c.side = Side::parse(v).unwrap_or(c.side),
+                "tv_ip" => tv_ip = v.into(),
+                "tv_side" => tv_side = Side::parse(v).unwrap_or(tv_side),
                 "push_counts" => c.push_counts = v.parse().unwrap_or(c.push_counts),
                 "private_clipboard" => c.share_private = v == "share",
                 k => log!("wadisplay.ini: unknown key {k}"),
             }
         }
-        log!("config {}: tablet {} side {} push {} adb {} private clipboard {}", path.display(), c.tablet_ip,
-             c.side.name(), c.push_counts, c.adb, if c.share_private { "share" } else { "keep" });
-        c
+        log!("config {}: push {} adb {} private clipboard {}", path.display(), c.push_counts, c.adb,
+             if c.share_private { "share" } else { "keep" });
+        let mut v = vec![c.clone()];
+        if !tv_ip.is_empty() {
+            v.push(Config { name: "TV", side_key: "tv_side", ip: tv_ip, side: tv_side, ..c });
+        }
+        for d in &v {
+            log!("{} {} on the {}", d.name, d.ip, d.side.name());
+        }
+        v
     }
 
     /// Rewrites one `key=` line in place.
@@ -146,10 +168,11 @@ enum Ev {
     Toggle,
     DesktopSwitch,
     Tray(u32),
-    Net(Vec<u8>),
-    Adb(adb::Event),
-    /// A clip from the tablet.
-    Clip(clip::Clip),
+    /// These carry the device's index in `App::peers`.
+    Net(usize, Vec<u8>),
+    Adb(usize, adb::Event),
+    /// A clip from that device.
+    Clip(usize, clip::Clip),
 }
 
 static TX: OnceLock<Sender<Ev>> = OnceLock::new();
@@ -205,16 +228,49 @@ fn percentiles(mut v: Vec<u32>) -> (f32, f32) {
     (v[v.len() / 2] as f32 / 1000.0, v[v.len() * 99 / 100] as f32 / 1000.0)
 }
 
-struct App {
+/// One device: its server, session and status.
+struct Peer {
     cfg: Config,
-    hwnd: HWND,
-    hider: HWND,
     sock: UdpSocket,
     key: Option<[u8; 32]>,
     tx_seq: u64,
     rx_seq: u64,
-    st: PcState,
     sw: Switch,
+    dirty: bool,
+    last_send: Instant,
+    launch: Sender<adb::Request>,
+    launch_at: Option<Instant>,
+    /// The server we launched; a silent one is relaunched only once it is gone.
+    server_pid: Option<u32>,
+    clip: Sender<clip::Cmd>,
+    /// Per device, so a clip synced to one device still goes to the other on entry.
+    clip_last: clip::Last,
+    tab: Option<TabState>,
+    heard: Option<Instant>,
+    /// (rtt us, apply us) of recent replies.
+    samples: VecDeque<(u32, u32)>,
+    adb_status: String,
+}
+
+impl Peer {
+    fn answering(&self, now: Instant) -> bool {
+        self.key.is_some() && self.heard.is_some_and(|t| now - t <= Duration::from_secs(3))
+    }
+
+    fn send(&mut self, msg: &Msg) {
+        let Some(key) = self.key else { return };
+        self.tx_seq += 1;
+        let _ = self.sock.send(&proto::seal(&key, proto::DIR_PC, self.tx_seq, msg));
+    }
+}
+
+struct App {
+    hwnd: HWND,
+    hider: HWND,
+    /// The tablet, then the TV if configured; at most one has control (`sw.active`).
+    peers: Vec<Peer>,
+    /// Input state; each device gets it with `active` set only for the one in control.
+    st: PcState,
     /// While parked: our 1 px clip, and another app's confinement to restore afterwards.
     park: Option<(RECT, Option<RECT>)>,
     /// Edge crossing is off (fullscreen app in front or cursor confined), checked every 250 ms.
@@ -222,30 +278,25 @@ struct App {
     blocked_at: Instant,
     wheel_acc: [i32; 2],
     abs_prev: Option<(i32, i32)>,
-    dirty: bool,
-    last_send: Instant,
     /// Raw Input key events minus keyboard hook calls; positive for 50 ms = hooks lost.
     key_balance: i64,
     hook_seen: u64,
     balance_since: Option<Instant>,
-    launch: Sender<adb::Request>,
-    launch_at: Option<Instant>,
-    /// The server we launched; a silent one is relaunched only once it is gone.
-    server_pid: Option<u32>,
-    clip: Sender<clip::Cmd>,
-    clip_last: clip::Last,
+    share_private: bool,
     paused: bool,
-    tab: Option<TabState>,
-    heard: Option<Instant>,
-    /// (rtt us, apply us) of recent replies.
-    samples: VecDeque<(u32, u32)>,
-    adb_status: String,
     tip_at: Instant,
     stats_at: Instant,
     quit: bool,
 }
 
 impl App {
+    /// Input changed: the device in control needs a packet.
+    fn touch(&mut self) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.sw.active) {
+            p.dirty = true;
+        }
+    }
+
     fn on(&mut self, ev: Ev, now: Instant) {
         match ev {
             Ev::Mouse(x, y, absolute) => {
@@ -263,10 +314,10 @@ impl App {
                 if (dx, dy) == (0, 0) {
                     return;
                 }
-                if self.sw.active {
+                if self.st.active {
                     self.st.x = self.st.x.wrapping_add(dx);
                     self.st.y = self.st.y.wrapping_add(dy);
-                    self.dirty = true;
+                    self.touch();
                     if let Some((r, _)) = &self.park {
                         capture::keep_parked(r);
                     }
@@ -281,19 +332,26 @@ impl App {
                         }
                     }
                     let (cx, cy) = capture::cursor_pos();
-                    let edge = if self.blocked { None } else { switch::on_edge(self.sw.side, cx, cy, r) };
-                    let a = self.sw.motion(dx, dy, edge, capture::pc_button_held(), now_ms());
-                    self.act(a);
+                    let (held, t) = (capture::pc_button_held(), now_ms());
+                    for i in 0..self.peers.len() {
+                        let side = self.peers[i].sw.side;
+                        let edge = if self.blocked { None } else { switch::on_edge(side, cx, cy, r) };
+                        let a = self.peers[i].sw.motion(dx, dy, edge, held, t);
+                        if a.is_some() {
+                            self.act(i, a);
+                            break;
+                        }
+                    }
                 }
             }
             Ev::RawKey => self.key_balance += 1,
             Ev::Key(u, down) => {
                 set_bit(&mut self.st.keys, u, down);
-                self.dirty = true;
+                self.touch();
             }
             Ev::Button(b, down) => {
                 if down { self.st.buttons |= 1 << b } else { self.st.buttons &= !(1 << b) }
-                self.dirty = true;
+                self.touch();
             }
             Ev::Wheel(horizontal, delta) => {
                 let acc = &mut self.wheel_acc[horizontal as usize];
@@ -302,108 +360,117 @@ impl App {
                 *acc -= n * 120;
                 let total = if horizontal { &mut self.st.hwheel } else { &mut self.st.wheel };
                 *total = total.wrapping_add(n);
-                self.dirty |= n != 0;
+                if n != 0 {
+                    self.touch();
+                }
             }
             Ev::Toggle => {
-                let (cx, cy) = capture::cursor_pos();
-                let a = self.sw.hotkey(switch::along(self.sw.side, cx, cy, screen()), now_ms());
-                if a.is_none() {
-                    log!("hotkey: tablet not connected");
-                }
-                self.act(a);
+                // Back to the PC, or into the connected device whose edge is nearest the cursor.
+                let ((cx, cy), r, t) = (capture::cursor_pos(), screen(), now_ms());
+                let i = self.peers.iter().position(|p| p.sw.active).or_else(|| {
+                    self.peers.iter().enumerate().filter(|(_, p)| p.sw.online(t))
+                        .min_by_key(|(_, p)| switch::distance(p.sw.side, cx, cy, r)).map(|(i, _)| i)
+                });
+                let Some(i) = i else { return log!("hotkey: no device connected") };
+                let f = switch::along(self.peers[i].sw.side, cx, cy, r);
+                let a = self.peers[i].sw.hotkey(f, t);
+                self.act(i, a);
             }
             Ev::DesktopSwitch => self.release_all("desktop switch"),
             Ev::Tray(m) if m == WM_RBUTTONUP || m == WM_LBUTTONUP => self.menu(),
             Ev::Tray(_) => {}
-            Ev::Net(buf) => self.on_net(&buf, now),
-            Ev::Adb(adb::Event::Launched(key, pid)) => {
-                (self.key, self.rx_seq, self.dirty, self.server_pid) = (Some(key), 0, true, Some(pid));
-                let _ = self.clip.send(clip::Cmd::Key(key));
-                self.adb_status = "server started, waiting for its reply".into();
+            Ev::Net(i, buf) => self.on_net(i, &buf, now),
+            Ev::Adb(i, adb::Event::Launched(key, pid)) => {
+                let p = &mut self.peers[i];
+                (p.key, p.rx_seq, p.dirty, p.server_pid) = (Some(key), 0, true, Some(pid));
+                let _ = p.clip.send(clip::Cmd::Key(key));
+                p.adb_status = "server started, waiting for its reply".into();
             }
-            Ev::Adb(adb::Event::Running) => {
-                let s = "tablet server running but not answering (tablet asleep?)";
+            Ev::Adb(i, adb::Event::Running) => {
+                let p = &mut self.peers[i];
+                let s = format!("{0} server running but not answering ({0} asleep?)", p.cfg.name);
                 // The check takes a moment: the server may have answered meanwhile.
-                let answering = self.heard.is_some_and(|t| now - t <= Duration::from_secs(3));
-                if !answering && self.adb_status != s {
+                let answering = p.heard.is_some_and(|t| now - t <= Duration::from_secs(3));
+                if !answering && p.adb_status != s {
                     log!("{s}");
-                    self.adb_status = s.into();
+                    p.adb_status = s;
                 }
             }
-            Ev::Adb(adb::Event::Failed(e)) => {
-                log!("{e}");
-                self.adb_status = e;
+            Ev::Adb(i, adb::Event::Failed(e)) => {
+                log!("{}: {e}", self.peers[i].cfg.name);
+                self.peers[i].adb_status = e;
             }
-            Ev::Clip(c) => clip::set(self.hwnd, &c, &self.clip_last),
+            Ev::Clip(i, c) => clip::set(self.hwnd, &c, &self.peers[i].clip_last),
         }
     }
 
-    fn act(&mut self, a: Option<Action>) {
+    fn act(&mut self, i: usize, a: Option<Action>) {
         let Some(a) = a else { return };
+        let (name, side) = (self.peers[i].cfg.name, self.peers[i].sw.side);
         match a {
             Action::Enter(f) => {
-                (self.st.active, self.st.warp_id, self.st.warp_y) = (true, self.sw.warp_id, f);
+                (self.st.active, self.st.warp_id, self.st.warp_y) = (true, self.peers[i].sw.warp_id, f);
                 capture::ACTIVE.store(true, Relaxed);
                 let (clip, prev) = capture::park(self.hider);
                 self.park = Some((clip, Some(prev).filter(|p| *p != win_rect(screen()))));
                 self.wheel_acc = [0; 2];
-                log!("tablet has control, entry at {:.1}%", f as f32 / 655.35);
-                let _ = self.clip.send(clip::Cmd::Enter);
+                log!("{name} has control, entry at {:.1}%", f as f32 / 655.35);
+                let _ = self.peers[i].clip.send(clip::Cmd::Enter);
             }
             Action::Leave(to) => {
                 self.st.active = false;
                 capture::ACTIVE.store(false, Relaxed);
                 let prev = self.park.take().and_then(|p| p.1);
-                capture::unpark(self.hider, prev, to.map(|f| switch::edge_point(self.sw.side, f, screen())));
-                log!("PC has control ({})", if to.is_some() { "edge" } else { "hotkey, timeout or release" });
+                capture::unpark(self.hider, prev, to.map(|f| switch::edge_point(side, f, screen())));
+                log!("PC has control from the {name} ({})", if to.is_some() { "edge" } else { "hotkey, timeout or release" });
             }
         }
-        self.dirty = true;
+        self.peers[i].dirty = true;
         self.tip_at = Instant::now();
     }
 
     fn release_all(&mut self, why: &str) {
         log!("{why}: releasing all keys and buttons");
-        let a = self.sw.force_leave();
-        self.act(a);
-        (self.st.keys, self.st.buttons, self.dirty) = ([0; 32], 0, true);
+        for i in 0..self.peers.len() {
+            let a = self.peers[i].sw.force_leave();
+            self.act(i, a);
+            self.peers[i].dirty = true;
+        }
+        (self.st.keys, self.st.buttons) = ([0; 32], 0);
         capture::reset_owners();
     }
 
-    fn on_net(&mut self, buf: &[u8], now: Instant) {
-        let Some(key) = self.key else { return };
-        let Some(Msg::Tab(ts)) = proto::open(&key, proto::DIR_TAB, buf, &mut self.rx_seq) else { return };
-        if self.heard.map_or(true, |t| now - t > Duration::from_secs(3)) {
-            log!("tablet server answers");
-            self.adb_status = "tablet server not answering".into(); // shown once it goes silent
+    fn on_net(&mut self, i: usize, buf: &[u8], now: Instant) {
+        let p = &mut self.peers[i];
+        let Some(key) = p.key else { return };
+        let Some(Msg::Tab(ts)) = proto::open(&key, proto::DIR_TAB, buf, &mut p.rx_seq) else { return };
+        if p.heard.map_or(true, |t| now - t > Duration::from_secs(3)) {
+            log!("{} server answers", p.cfg.name);
+            p.adb_status = format!("{} server not answering", p.cfg.name); // shown once it goes silent
         }
         let rtt = now_us().saturating_sub(ts.echo_us) as u32;
-        self.samples.push_back((rtt, ts.apply_us));
-        if self.samples.len() > 1000 {
-            self.samples.pop_front();
+        p.samples.push_back((rtt, ts.apply_us));
+        if p.samples.len() > 1000 {
+            p.samples.pop_front();
         }
         let flags = |t: &TabState| (t.screen_on, t.locked, t.strip_visible);
-        if self.tab.as_ref().map(flags) != Some(flags(&ts)) {
-            log!("tablet: screen_on {} locked {} strip visible {}", ts.screen_on, ts.locked, ts.strip_visible);
+        if p.tab.as_ref().map(flags) != Some(flags(&ts)) {
+            log!("{}: screen_on {} locked {} strip visible {}", p.cfg.name, ts.screen_on, ts.locked, ts.strip_visible);
             self.tip_at = now;
         }
-        (self.tab, self.heard) = (Some(ts), Some(now));
-        let a = self.sw.tab(&ts, now_ms());
-        self.act(a);
-    }
-
-    fn send(&mut self, msg: &Msg) {
-        let Some(key) = self.key else { return };
-        self.tx_seq += 1;
-        let _ = self.sock.send(&proto::seal(&key, proto::DIR_PC, self.tx_seq, msg));
+        (p.tab, p.heard) = (Some(ts), Some(now));
+        let a = p.sw.tab(&ts, now_ms());
+        self.act(i, a);
     }
 
     fn tick(&mut self, now: Instant) {
-        let a = self.sw.tick(now_ms());
-        if a.is_some() {
-            log!("no tablet heartbeat for {} ms", switch::HEARTBEAT_MS);
+        for i in 0..self.peers.len() {
+            let a = self.peers[i].sw.tick(now_ms());
+            if a.is_some() {
+                log!("no {} heartbeat for {} ms", self.peers[i].cfg.name, switch::HEARTBEAT_MS);
+            }
+            self.act(i, a);
         }
-        self.act(a);
 
         let h = capture::HOOK_KEYS.load(Relaxed);
         self.key_balance -= (h - self.hook_seen) as i64;
@@ -419,24 +486,26 @@ impl App {
             (self.key_balance, self.balance_since) = (0, None);
         }
 
-        let silent = self.heard.map_or(true, |t| now - t > Duration::from_secs(3));
-        if !self.paused && silent && self.launch_at.map_or(true, |t| now - t > Duration::from_secs(10)) {
-            self.launch_at = Some(now);
-            let cfg = self.cfg.clone();
-            let _ = self.launch.send(match self.server_pid {
-                Some(pid) => adb::Request::Revive(cfg, pid),
-                None => {
-                    self.adb_status = "connecting over adb".into();
-                    adb::Request::Launch(cfg)
-                }
-            });
-        }
+        for p in &mut self.peers {
+            let silent = p.heard.map_or(true, |t| now - t > Duration::from_secs(3));
+            if !self.paused && silent && p.launch_at.map_or(true, |t| now - t > Duration::from_secs(10)) {
+                p.launch_at = Some(now);
+                let cfg = p.cfg.clone();
+                let _ = p.launch.send(match p.server_pid {
+                    Some(pid) => adb::Request::Revive(cfg, pid),
+                    None => {
+                        p.adb_status = "connecting over adb".into();
+                        adb::Request::Launch(cfg)
+                    }
+                });
+            }
 
-        let every = Duration::from_millis(if self.st.active { 30 } else { 1000 });
-        if !self.paused && (self.dirty || now - self.last_send >= every) {
-            self.st.sent_us = now_us();
-            self.send(&Msg::Pc(self.st));
-            (self.dirty, self.last_send) = (false, now);
+            let every = Duration::from_millis(if p.sw.active { 30 } else { 1000 });
+            if !self.paused && (p.dirty || now - p.last_send >= every) {
+                self.st.sent_us = now_us();
+                p.send(&Msg::Pc(PcState { active: p.sw.active, ..self.st }));
+                (p.dirty, p.last_send) = (false, now);
+            }
         }
 
         if now >= self.tip_at {
@@ -444,11 +513,13 @@ impl App {
             let (icon, tip) = self.status(now);
             tray::set(self.hwnd, icon, &tip);
         }
-        if now >= self.stats_at && !self.samples.is_empty() {
+        if now >= self.stats_at && self.peers.iter().any(|p| !p.samples.is_empty()) {
             self.stats_at = now + Duration::from_secs(60);
-            let (r50, r99) = percentiles(self.samples.iter().map(|s| s.0 / 2).collect());
-            let (a50, a99) = percentiles(self.samples.iter().map(|s| s.1).collect());
-            log!("latency: rtt/2 p50 {r50:.2} p99 {r99:.2} ms, apply p50 {a50:.3} p99 {a99:.3} ms");
+            for p in self.peers.iter().filter(|p| !p.samples.is_empty()) {
+                let (r50, r99) = percentiles(p.samples.iter().map(|s| s.0 / 2).collect());
+                let (a50, a99) = percentiles(p.samples.iter().map(|s| s.1).collect());
+                log!("{} latency: rtt/2 p50 {r50:.2} p99 {r99:.2} ms, apply p50 {a50:.3} p99 {a99:.3} ms", p.cfg.name);
+            }
         }
     }
 
@@ -456,64 +527,106 @@ impl App {
         if self.paused {
             return (tray::Icon::Offline, "wadisplay: disconnected".into());
         }
-        if self.key.is_none() || self.heard.map_or(true, |t| now - t > Duration::from_secs(3)) {
-            return (tray::Icon::Offline, format!("wadisplay: {}", self.adb_status));
+        // The tooltip holds 127 characters: name the device only when there are two.
+        let two = self.peers.len() > 1;
+        let named = |p: &Peer, s: &str| if two { format!("{}: {s}", p.cfg.name) } else { s.to_string() };
+        if !self.peers.iter().any(|p| p.answering(now)) {
+            let lines: Vec<String> = self.peers.iter().map(|p| named(p, &p.adb_status)).collect();
+            return (tray::Icon::Offline, format!("wadisplay: {}", lines.join("\n")));
         }
-        let (icon, who) = if self.st.active { (tray::Icon::Tablet, "tablet has control") } else { (tray::Icon::Pc, "PC has control") };
-        let (p50, p99) = percentiles(self.samples.iter().map(|s| s.0 / 2 + s.1).collect());
-        let mut s = format!("wadisplay: {who}\nlatency {p50:.1} ms, p99 {p99:.1} ms");
-        match self.tab {
-            Some(t) if !t.screen_on => s += "\ntablet screen off: Ctrl+Alt+Space enters",
-            Some(t) if self.st.active && !t.strip_visible => s += "\nedge return off here: Ctrl+Alt+Space",
-            _ if !self.st.active && self.blocked => s += "\nfullscreen app: edges off, Ctrl+Alt+Space",
+        let active = self.peers.iter().find(|p| p.sw.active);
+        let (icon, mut s) = match active {
+            Some(p) => (tray::Icon::Tablet, format!("wadisplay: {} has control", p.cfg.name)),
+            None => (tray::Icon::Pc, "wadisplay: PC has control".to_string()),
+        };
+        for p in &self.peers {
+            if !p.answering(now) {
+                s += &format!("\n{}", named(p, &p.adb_status));
+                continue;
+            }
+            let (p50, p99) = percentiles(p.samples.iter().map(|s| s.0 / 2 + s.1).collect());
+            s += &if two { format!("\n{} {p50:.1} ms, p99 {p99:.1}", p.cfg.name) } else { format!("\nlatency {p50:.1} ms, p99 {p99:.1} ms") };
+        }
+        for p in self.peers.iter().filter(|p| p.answering(now) && p.tab.is_some_and(|t| !t.screen_on)) {
+            s += &format!("\n{} screen off: Ctrl+Alt+Space enters", p.cfg.name);
+        }
+        match active {
+            Some(p) if p.tab.is_some_and(|t| t.screen_on && !t.strip_visible) => s += "\nedge return off here: Ctrl+Alt+Space",
+            None if self.blocked => s += "\nfullscreen app: edges off, Ctrl+Alt+Space",
             _ => {}
         }
         (icon, s)
     }
 
-    fn bye(&mut self) {
-        let a = self.sw.force_leave();
-        self.act(a);
+    fn bye(&mut self, i: usize) {
+        let a = self.peers[i].sw.force_leave();
+        self.act(i, a);
+        let p = &mut self.peers[i];
         for _ in 0..3 {
-            self.send(&Msg::Bye);
+            p.send(&Msg::Bye);
         }
-        self.key = None;
+        p.key = None;
+    }
+
+    fn bye_all(&mut self) {
+        for i in 0..self.peers.len() {
+            self.bye(i);
+        }
+    }
+
+    /// Moves device `i` to `side`: saved, and its server restarted (it takes the side at launch:
+    /// warp corner, strip edge).
+    fn set_side(&mut self, i: usize, side: Side) {
+        self.bye(i);
+        let p = &mut self.peers[i];
+        log!("tray: {} on the {}", p.cfg.name, side.name());
+        p.cfg.side = side;
+        p.sw = Switch::new(side, p.cfg.push_counts); // offline until the new server answers
+        Config::save(p.cfg.side_key, side.name());
+        if !self.paused {
+            p.launch_at = Some(Instant::now());
+            p.adb_status = format!("restarting the {} server", p.cfg.name);
+            let _ = p.launch.send(adb::Request::Launch(p.cfg.clone()));
+        }
     }
 
     fn menu(&mut self) {
         let status = self.status(Instant::now()).1.replace('\n', " | ");
-        match tray::menu(self.hwnd, &status, !self.paused, self.cfg.side, !self.cfg.share_private) {
+        match tray::menu(self.hwnd, &status, !self.paused, self.peers[0].cfg.side, !self.share_private) {
             cmd @ (tray::CMD_LEFT | tray::CMD_RIGHT) => {
                 let side = if cmd == tray::CMD_LEFT { Side::Left } else { Side::Right };
-                if side != self.cfg.side {
-                    log!("tray: tablet on the {}", side.name());
-                    self.bye();
-                    self.cfg.side = side;
-                    self.sw = Switch::new(side, self.cfg.push_counts); // offline until the new server answers
-                    Config::save("side", side.name());
-                    if !self.paused {
-                        // The server takes the side at launch (warp corner, strip edge).
-                        self.launch_at = Some(Instant::now());
-                        self.adb_status = "restarting the tablet server".into();
-                        let _ = self.launch.send(adb::Request::Launch(self.cfg.clone()));
+                let old = self.peers[0].cfg.side;
+                if side != old {
+                    // A TV on that edge swaps to the tablet's old one.
+                    if let Some(j) = (1..self.peers.len()).find(|&j| self.peers[j].cfg.side == side) {
+                        self.set_side(j, old);
                     }
+                    self.set_side(0, side);
                 }
             }
             tray::CMD_KEEP_PRIVATE => {
-                self.cfg.share_private = !self.cfg.share_private;
-                let v = if self.cfg.share_private { "share" } else { "keep" };
+                self.share_private = !self.share_private;
+                let v = if self.share_private { "share" } else { "keep" };
                 log!("tray: private clipboard text: {v}");
                 Config::save("private_clipboard", v);
-                let _ = self.clip.send(clip::Cmd::SharePrivate(self.cfg.share_private));
+                for p in &mut self.peers {
+                    p.cfg.share_private = self.share_private;
+                    let _ = p.clip.send(clip::Cmd::SharePrivate(self.share_private));
+                }
             }
-            tray::CMD_CONNECT if self.paused => (self.paused, self.launch_at) = (false, None),
+            tray::CMD_CONNECT if self.paused => {
+                self.paused = false;
+                for p in &mut self.peers {
+                    p.launch_at = None;
+                }
+            }
             tray::CMD_CONNECT => {
-                self.bye();
+                self.bye_all();
                 self.paused = true;
                 log!("disconnected from the tray");
             }
             tray::CMD_QUIT => {
-                self.bye();
+                self.bye_all();
                 self.quit = true;
             }
             _ => {}
@@ -527,7 +640,7 @@ fn message_box(text: &str) {
     unsafe { MessageBoxW(None, PCWSTR(t.as_ptr()), w!("wadisplay"), MB_OK) };
 }
 
-fn run(cfg: Config) {
+fn run(devices: Vec<Config>) {
     let (tx, rx) = mpsc::channel();
     let _ = TX.set(tx);
     let (hwnd, hider) = unsafe {
@@ -550,34 +663,40 @@ fn run(cfg: Config) {
     }
     tray::add(hwnd, tray::Icon::Offline, "wadisplay: starting");
 
-    let sock = UdpSocket::bind("0.0.0.0:0").expect("udp bind");
-    sock.connect((cfg.tablet_ip.as_str(), proto::PORT)).expect("udp connect");
-    let rs = sock.try_clone().unwrap();
-    std::thread::spawn(move || {
-        let mut b = [0u8; 512];
-        loop {
-            match rs.recv(&mut b) {
-                Ok(n) => emit_wake(Ev::Net(b[..n].to_vec())),
-                // ICMP port unreachable shows up as WSAECONNRESET on a connected socket.
-                Err(_) => std::thread::sleep(Duration::from_millis(5)),
-            }
-        }
-    });
-    let (launch, launch_rx) = mpsc::channel();
-    std::thread::spawn(move || adb::thread(launch_rx, |e| emit_wake(Ev::Adb(e))));
-    let (clip, clip_rx) = mpsc::channel();
-    let clip_last = clip::Last::default();
-    let (ip, last) = (cfg.tablet_ip.clone(), clip_last.clone());
-    let share_private = cfg.share_private;
-    std::thread::spawn(move || clip::thread(ip, clip_rx, last, share_private, |c| emit_wake(Ev::Clip(c))));
-
     let now = Instant::now();
+    let share_private = devices[0].share_private;
+    // Per device: a socket and its reader, an adb thread (a slow or prompting device holds up
+    // only itself) and a clipboard thread.
+    let peers = devices.into_iter().enumerate().map(|(i, cfg)| {
+        let sock = UdpSocket::bind("0.0.0.0:0").expect("udp bind");
+        sock.connect((cfg.ip.as_str(), proto::PORT)).expect("udp connect");
+        let rs = sock.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 512];
+            loop {
+                match rs.recv(&mut b) {
+                    Ok(n) => emit_wake(Ev::Net(i, b[..n].to_vec())),
+                    // ICMP port unreachable shows up as WSAECONNRESET on a connected socket.
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        let (launch, launch_rx) = mpsc::channel();
+        std::thread::spawn(move || adb::thread(launch_rx, |e| emit_wake(Ev::Adb(i, e))));
+        let (clip, clip_rx) = mpsc::channel();
+        let clip_last = clip::Last::default();
+        let (ip, last) = (cfg.ip.clone(), clip_last.clone());
+        let name = cfg.name;
+        std::thread::spawn(move || clip::thread(name, ip, clip_rx, last, share_private, move |c| emit_wake(Ev::Clip(i, c))));
+        Peer { sw: Switch::new(cfg.side, cfg.push_counts), cfg, sock, key: None, tx_seq: 0, rx_seq: 0, dirty: false,
+               last_send: now, launch, launch_at: None, server_pid: None, clip, clip_last, tab: None, heard: None,
+               samples: VecDeque::new(), adb_status: "starting".into() }
+    }).collect();
+
     let mut app = App {
-        cfg: cfg.clone(), hwnd, hider, sock, key: None, tx_seq: 0, rx_seq: 0, st: PcState::default(),
-        sw: Switch::new(cfg.side, cfg.push_counts), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None,
-        dirty: false, last_send: now, key_balance: 0, hook_seen: capture::HOOK_KEYS.load(Relaxed),
-        balance_since: None, launch, launch_at: None, server_pid: None, clip, clip_last, paused: false, tab: None, heard: None,
-        samples: VecDeque::new(), adb_status: "starting".into(), tip_at: now, stats_at: now, quit: false,
+        hwnd, hider, peers, st: PcState::default(), park: None, blocked: false, blocked_at: now, wheel_acc: [0; 2],
+        abs_prev: None, key_balance: 0, hook_seen: capture::HOOK_KEYS.load(Relaxed), balance_since: None,
+        share_private, paused: false, tip_at: now, stats_at: now, quit: false,
     };
     log!("running");
     while !app.quit {
@@ -605,7 +724,7 @@ fn bench(cfg: &Config, secs: u64) {
     let report = (|| -> Result<String, String> {
         let (key, _) = adb::launch(cfg)?;
         let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-        sock.connect((cfg.tablet_ip.as_str(), proto::PORT)).map_err(|e| e.to_string())?;
+        sock.connect((cfg.ip.as_str(), proto::PORT)).map_err(|e| e.to_string())?;
         sock.set_nonblocking(true).map_err(|e| e.to_string())?;
         let (mut st, mut tx_seq, mut rx_seq) = (PcState { active: true, warp_id: 1, warp_y: 32768, ..Default::default() }, 0, 0);
         let (mut rtt, mut apply, mut buf) = (vec![], vec![], [0u8; 512]);
@@ -667,14 +786,19 @@ fn main() {
         let _ = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s as *const _ as _,
                                       std::mem::size_of_val(&s) as u32);
     }
-    let cfg = Config::load();
-    if cfg.tablet_ip.is_empty() {
+    let devices = Config::load();
+    if devices[0].ip.is_empty() {
         return message_box(&format!("Set tablet_ip to the tablet's Wi-Fi IP address in\n{}\nthen start wadisplay again.",
                                     Config::path().display()));
     }
+    if devices.len() > 1 && devices[0].side == devices[1].side {
+        return message_box(&format!("The tablet and the TV are both on the {} edge. Set tv_side to another edge in\n{}\n\
+                                     then start wadisplay again.", devices[0].side.name(), Config::path().display()));
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.iter().position(|a| a == "--bench") {
-        Some(i) => bench(&cfg, args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(60)),
-        None => run(cfg),
+        // The tablet only.
+        Some(i) => bench(&devices[0], args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(60)),
+        None => run(devices),
     }
 }

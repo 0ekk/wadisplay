@@ -741,3 +741,35 @@ under "Open checks".
   strip visible, the entry warp to the middle of the edge landed with 0.05% error, a push out of the left edge
   returned `return_y` 32798, RTT 2.5 to 8 ms, and `Bye` exited cleanly. Running the tablet and the
   TV from one exe is the next section.
+
+### Tablet and TV at once (2026-10-21)
+- Question from the user: use the tablet and the TV at the same time, each on its own edge.
+- Decisions (user-confirmed): the TV sits on the right and the tablet's default side becomes left.
+  While the PC has control, Ctrl+Alt+Space enters the connected device whose edge is nearest the
+  cursor (`switch::distance`); while a device has control it returns to the PC.
+- Decisions (implementation):
+  - Settings: `tv_ip` (empty: the tablet alone, as before) and `tv_side` (default right). The same
+    edge for both is refused at start with a message box. The default for `side` is now left; it
+    applies to new ini files and a missing key, existing `side=` lines stay.
+  - `Config` describes one device (name, the ini key of its side, IP; adb path, `push_counts` and
+    the private clipboard choice are shared). `App` holds one `Peer` per device with its own UDP
+    socket and reader thread, session key and sequence numbers, `Switch`, adb thread (an install
+    prompt on the TV holds up only the TV), clipboard thread and clipboard sequence number (a clip
+    synced to one device still goes to the other on entry), status and latency samples.
+  - One `PcState` collects input; each device gets it with `active` set only for the one in
+    control. A server ignores input while inactive and rebases its counters on entry, so the wire
+    format and the server stay as they are. Input marks only the device in control for sending;
+    the other keeps its 1 s heartbeat.
+  - Edges: each device watches its own edge; the first to cross wins.
+  - Tray: "Tablet on the left/right" still moves the tablet; a TV on that edge swaps to the
+    tablet's old one, and both servers restart. The tooltip (127 characters) names the device only
+    when there are two. `--bench` measures the tablet only. Logs name the device.
+- Impact: a single-device setup behaves as before, apart from the default side in new ini files and
+  the device name in log lines. No protocol, server or APK change.
+- Verification: `cargo test` (proto 5, server 10) and `cargo.exe test -p wadisplay-pc` (8, with
+  the new `distance` asserts) pass; release builds have no warnings. With the user's exe, tablet on
+  the left and TV on the right: both servers launched and answered; edge crossings went TV, PC,
+  tablet, PC, tablet, PC, TV, PC; clipboard text went to the TV on entry and again to the tablet
+  on its entry; the hotkey entered the TV with the cursor on the right half and the tablet with it
+  on the left half, and returned to the PC from each. The TV kept the companion app it already had
+  (hash files matched), so no second install notice.

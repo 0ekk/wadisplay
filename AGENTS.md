@@ -57,7 +57,7 @@ Windows `adb.exe` reads stdin in text mode (byte 0x1A ends it) and turns LF into
 - Start `wadisplay.exe` (UAC prompt every start). Settings and log live in `%LOCALAPPDATA%\wadisplay\`
   (`wadisplay.ini`, created with defaults on first start, which then asks for `tablet_ip`;
   `wadisplay.log`, rewritten each start). The tray menu
-  switches the tablet between left and right and whether private clipboard text stays on the PC. It connects adb to `tablet_ip:5555` (running
+  switches the tablet between left and right and whether private clipboard text stays on the PC. It connects adb to `tablet_ip:5555`, and to `tv_ip:5555` for an optional second device on another edge (running
   `adb tcpip 5555` if the tablet is on USB), deploys the server/APK when their hashes change and
   launches the server.
 - Latency bench: `wadisplay.exe --bench [seconds]` (default 60; result in a message box and the log).

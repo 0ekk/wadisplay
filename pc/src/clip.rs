@@ -1,6 +1,6 @@
-//! Clipboard sync. The clipboard follows the pointer: when the tablet takes control this PC's
-//! text or image goes to the tablet if the clipboard changed since the last sync; when the PC
-//! takes control back, the server sends the tablet's new clip. Frames sealed with the session
+//! Clipboard sync, one thread per device. The clipboard follows the pointer: when the tablet
+//! (or TV) takes control this PC's text or image goes to it if the clipboard changed since the
+//! last sync with it; when the PC takes control back, the server sends the device's new clip. Frames sealed with the session
 //! key, over TCP.
 
 use std::io::{Read, Write};
@@ -44,7 +44,7 @@ pub enum Clip {
 pub type Last = Arc<AtomicU32>;
 
 /// Owns the connection. Tablet clips arrive through `emit`, from a reader thread.
-pub fn thread(ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool,
+pub fn thread(name: &'static str, ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool,
               emit: impl Fn(Clip) + Send + Clone + 'static) {
     let mut key: Option<([u8; 32], Arc<AtomicU64>)> = None;
     let mut conn: Option<TcpStream> = None;
@@ -54,7 +54,7 @@ pub fn thread(ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool
             Cmd::Key(k) => {
                 close(&mut conn);
                 (key, tx_seq) = (Some((k, Arc::new(AtomicU64::new(0)))), 0);
-                conn = connect(&ip, key.as_ref().unwrap(), emit.clone());
+                conn = connect(name, &ip, key.as_ref().unwrap(), emit.clone());
             }
             Cmd::SharePrivate(v) => share_private = v,
             Cmd::Enter => {
@@ -72,7 +72,7 @@ pub fn thread(ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool
                 // A connection that died quietly fails on write: reconnect and send once more.
                 for _ in 0..2 {
                     if conn.is_none() {
-                        conn = connect(&ip, k, emit.clone());
+                        conn = connect(name, &ip, k, emit.clone());
                     }
                     let Some(s) = &mut conn else { break };
                     tx_seq += 1; // spent even if the write fails: a nonce is never reused
@@ -80,7 +80,7 @@ pub fn thread(ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool
                     // In pieces, so the 2 s write timeout means "no progress", not "all of an image".
                     match f.chunks(64 << 10).try_for_each(|p| s.write_all(p)) {
                         Ok(()) => {
-                            log!("clipboard: {} to the tablet", proto::clip_desc(&c));
+                            log!("clipboard: {} to the {name}", proto::clip_desc(&c));
                             break;
                         }
                         Err(e) => {
@@ -100,7 +100,7 @@ fn close(conn: &mut Option<TcpStream>) {
     }
 }
 
-fn connect(ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(Clip) + Send + 'static)
+fn connect(name: &'static str, ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(Clip) + Send + 'static)
            -> Option<TcpStream> {
     let addr = (ip, proto::CLIP_PORT).to_socket_addrs().ok()?.next()?;
     let c = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
@@ -126,16 +126,16 @@ fn connect(ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(C
                 continue;
             };
             rx_seq.store(seq, Relaxed);
-            log!("clipboard: {} from the tablet", proto::clip_desc(&c));
+            log!("clipboard: {} from the {name}", proto::clip_desc(&c));
             // Decoding takes a while for big images: here, not on the main thread.
             match (c[0], c[1..].to_vec()) {
                 (proto::CLIP_TEXT, t) => match String::from_utf8(t) {
                     Ok(t) => emit(Clip::Text(t.replace("\r\n", "\n").replace('\n', "\r\n"))),
-                    Err(_) => log!("clipboard: tablet text is not UTF-8"),
+                    Err(_) => log!("clipboard: {name} text is not UTF-8"),
                 },
                 (_, file) => match image::dib(&file) {
                     Ok(dib) => emit(Clip::Image { dib, png: file.starts_with(b"\x89PNG").then_some(file) }),
-                    Err(e) => log!("clipboard: tablet image: {e}"),
+                    Err(e) => log!("clipboard: {name} image: {e}"),
                 },
             }
         }

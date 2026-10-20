@@ -45,6 +45,16 @@ pub fn on_edge(side: Side, x: i32, y: i32, r: Rect) -> Option<u16> {
     on.then(|| along(side, x, y, r))
 }
 
+/// How far the cursor is from the shared edge, in px (the hotkey enters the nearest device).
+pub fn distance(side: Side, x: i32, y: i32, r: Rect) -> i32 {
+    match side {
+        Side::Right => r.r - 1 - x,
+        Side::Left => x - r.l,
+        Side::Top => y - r.t,
+        Side::Bottom => r.b - 1 - y,
+    }
+}
+
 /// Point on the shared edge at fraction `f`.
 pub fn edge_point(side: Side, f: u16, r: Rect) -> (i32, i32) {
     let at = |start: i32, len: i32| start + ((f as i64 * (len - 1).max(0) as i64 + 32767) / 65535) as i32;
@@ -160,6 +170,10 @@ mod tests {
         assert_eq!(edge_point(Side::Bottom, 0, R), (0, 1439));
         let f = along(Side::Left, 0, 720, R);
         assert_eq!(edge_point(Side::Left, f, R), (0, 720));
+        assert_eq!(distance(Side::Left, 100, 700, R), 100);
+        assert_eq!(distance(Side::Right, 100, 700, R), 2459);
+        assert_eq!(distance(Side::Top, 0, 1439, R), 1439);
+        assert_eq!(distance(Side::Bottom, 0, 1439, R), 0);
     }
 
     #[test]

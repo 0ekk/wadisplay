@@ -1,5 +1,5 @@
-//! adb thread: connect (re-arming `adb tcpip` over USB after a tablet reboot), deploy the
-//! embedded server and companion APK when their hashes change, launch the server.
+//! adb thread, one per device: connect (re-arming `adb tcpip` over USB after a tablet reboot),
+//! deploy the embedded server and companion APK when their hashes change, launch the server.
 
 use std::io::Write;
 use std::os::windows::process::CommandExt;
@@ -97,7 +97,8 @@ impl Adb<'_> {
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
-        Err(format!("cannot reach {} over adb (tablet off Wi-Fi while asleep? After a tablet reboot, plug in USB once)", self.serial))
+        let n = self.cfg.name;
+        Err(format!("cannot reach {} over adb ({n} off Wi-Fi while asleep? After a {n} reboot, plug in USB once)", self.serial))
     }
 
     /// Pushes `data` to `path` unless the hash file next to it already matches.
@@ -175,7 +176,7 @@ impl Adb<'_> {
 }
 
 fn adb(cfg: &Config) -> Adb<'_> {
-    Adb { serial: format!("{}:5555", cfg.tablet_ip), cfg }
+    Adb { serial: format!("{}:5555", cfg.ip), cfg }
 }
 
 /// Connects, deploys and starts the server; returns its key and pid.

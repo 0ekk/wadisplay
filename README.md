@@ -9,6 +9,7 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 
 ## Features
 - Edge crossing in both directions, plus a hotkey (`Ctrl+Alt+Space`) to switch at any time.
+- Optionally a second device on another edge at the same time, such as a TV.
 - Keyboard follows the pointer; the tablet's input method composes Chinese and other languages.
 - Shared clipboard (text and images): copy on one device, move the pointer over, paste.
 - Low latency: about 1.6 ms median, 2.8 ms p99 from PC input to the tablet's input device
@@ -39,9 +40,13 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
    that the cable can come off.
 
 ## Using it
-- Move the pointer past the monitor edge on the tablet's side (right by default) to control the
+- Move the pointer past the monitor edge on the tablet's side (left by default) to control the
   tablet; move it back past the matching tablet edge to return.
 - `Ctrl+Alt+Space` switches either way. It is handled on the PC and never reaches the tablet.
+  With a TV as well, it enters the device whose edge is nearest the pointer, and returns to the
+  PC from either.
+- A second device (`tv_ip`, `tv_side`) works the same way from its own edge; each has its own
+  server and companion app.
 - Crossing is suppressed while a mouse button is held (so dragging a window to the edge for Snap
   stays on the PC), while a fullscreen app such as a game is in front, and while another app
   confines the cursor. The hotkey still works in all three cases.
@@ -49,8 +54,9 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
   image; moving back gives the PC the tablet's. Text that password managers mark as private stays on
   the PC unless you uncheck "Keep private clipboard text on this PC" in the tray menu.
   On the tablet, Android then shows "Shell read the clipboard." (once per tablet copy).
-- Tray menu: the current status, "Tablet on the left" / "Tablet on the right", "Keep private
-  clipboard text on this PC", Connect/Disconnect, Quit. Hover the tray icon for latency and hints.
+- Tray menu: the current status, "Tablet on the left" / "Tablet on the right" (a TV on that
+  edge swaps to the other), "Keep private clipboard text on this PC", Connect/Disconnect, Quit.
+  Hover the tray icon for latency and hints.
 
 | Tray icon | Meaning |
 |---|---|
@@ -65,17 +71,19 @@ right-click, scrolling, shortcuts and the tablet's own input method all work nat
 |---|---|---|
 | `tablet_ip` | (none, required) | The tablet's Wi-Fi IP address |
 | `adb` | `adb` | Path to `adb.exe`, or `adb` to find it on `PATH` |
-| `side` | `right` | Where the tablet sits next to the monitor: `left`, `right`, `top`, `bottom` (the tray menu sets left/right) |
+| `side` | `left` | Where the tablet sits next to the monitor: `left`, `right`, `top`, `bottom` (the tray menu sets left/right) |
+| `tv_ip` | (none) | A second device's Wi-Fi IP address, such as a TV; leave empty for the tablet alone |
+| `tv_side` | `right` | Where the second device sits; must differ from `side` |
 | `push_counts` | `20` | Raw mouse counts to push past the edge before control crosses |
 | `private_clipboard` | `keep` | Text that password managers mark private: `keep` it on the PC or `share` it (the tray menu sets this) |
 
 Logs: `%LOCALAPPDATA%\wadisplay\wadisplay.log` on the PC (rewritten at each start) and
 `/data/local/tmp/wadisplay.log` on the tablet (`adb shell cat /data/local/tmp/wadisplay.log`).
-`wadisplay.exe --bench [seconds]` measures latency (default 60 s) and shows the result.
+`wadisplay.exe --bench [seconds]` measures latency to the tablet (default 60 s) and shows the result.
 
 ## Limitations
 - The clipboard carries text (up to 1 MiB) and images (up to 32 MiB as a PNG or JPEG file); no
-  files, no file drag-and-drop, one tablet.
+  files, no file drag-and-drop.
 - A pasted image needs a tablet app that accepts pasted images (chat apps such as Telegram do);
   Huawei Notes, for one, takes only text from the clipboard.
 - Some tablet apps have no paste shortcut. In the Termius terminal, Ctrl+V reaches the shell as
