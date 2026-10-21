@@ -970,3 +970,85 @@ under "Open checks".
   after a reboot, serial number filled in, new address, new on USB / wireless debugging / 5555,
   ignored, no network, empty serial numbers never match). Release build without warnings.
   Untested live: a device joining, an address change, the notifications.
+
+### D3 PC receivers (2026-10-21)
+- Rationale: a second Windows PC can sit at an edge like a tablet. It takes injected input, so it
+  must only obey a PC its user agreed to, and pairing must hold against a LAN attacker without any
+  new crate (CNG does P-256 and SHA-256).
+- Decisions:
+  - Role: `role=control` (default) or `role=receive` in `wadisplay.ini`; the tray item "Be
+    controlled by another PC" saves it and restarts the exe (`--restart` makes the new instance
+    wait up to 10 s for the old one's mutex). A receiver runs `receiver::run`: no hooks, no adb, no
+    devices; its tray shows who is connected and has "Unpair all PCs".
+  - Ports on the receiver, all inbound (Windows asks to allow them on the first start; the log says
+    so): UDP 27186 (`link::CONTROL_PORT`: discovery, pairing, Hello), UDP 27183 (state), TCP 27185
+    (clipboard). The controlling PC needs no inbound rule: it broadcasts `Query` every 2 s from one
+    socket per local IPv4 address and receivers answer unicast (Windows lets unicast answers to a
+    broadcast in). Broadcast only, so a receiver on another subnet is not found (`ponytail:`).
+  - Wire (`link.rs`, magic `WAD1`): `Beacon` carries the receiver's id, a nonce that changes every
+    5 s, its P-256 public key and computer name. `paired.ini` holds this PC's random 16-byte id and,
+    per paired PC, its id, name and 32-byte key (the same file on both roles).
+  - Pairing, numeric comparison as in Bluetooth (`pair.rs`): `PairRequest` (the controlling PC's
+    fresh key pair) -> `Commit` (SHA-256 of both public keys and the receiver's nonce) -> `Nonce`
+    -> `Reveal`; the controlling PC checks the commitment, both derive a 6-digit code and the paired
+    key from the ECDH secret, both public keys and both nonces, and both show "Do the codes match?"
+    on a thread. The commitment makes a man in the middle match the codes with a chance of one in
+    a million. `Confirm` carries each answer sealed under the new key (yes at seq 1, no at seq 2,
+    so retransmits repeat bytes and no nonce seals both); the controlling PC repeats its Confirm
+    every 500 ms and the receiver answers only once its own user did, so each side finishes only
+    after the other confirmed. A receiver pairs with one PC at a time (busy for 120 s otherwise).
+    The controlling PC pairs with every new receiver it hears, one at a time; a declined or timed
+    out pairing is not asked again until Add by IP or a restart, so unanswered questions do not
+    pile up.
+  - Session: `Hello` is the paired key sealing (at a random seq) the beacon nonce, a fresh session
+    key, the side and `push_counts`. The receiver takes only one of its last two nonces and never a
+    session key it used before, so an old Hello cannot be replayed; while one paired PC is in
+    session (heard within 3 s), Hellos from another are refused, so two controlling PCs do not
+    take it from each other. After that the receiver behaves as the Android server: PcState
+    datagrams, TabState replies (every 20 ms while it has control, else one per packet), release
+    after 150 ms of silence, Bye, and the clipboard over the same TCP framing (its clip goes out
+    when control returns, if it changed since the last sync). It always reports screen on and
+    unlocked (`ponytail:`: on a locked PC injected input goes nowhere; Ctrl+Alt+Space returns).
+  - Input (`inject.rs`, pure): counter diffs, keys before the move and buttons after it, as the
+    server; entry with `SetCursorPos` at the fraction along the edge facing the controlling PC;
+    return when the cursor pushes `push_counts` out of that edge. `receiver::send` turns that into
+    `SendInput`: relative moves (the receiver's own pointer speed applies), wheel notches times 120,
+    X buttons, keys as scancodes (`keymap::inject`, the inverse of `usage`; Pause and NumLock as
+    virtual keys).
+  - Controlling side: a PC is a device of kind PC whose `id` is the receiver's id in hex. It has no
+    adb thread; `App::launch` sends a Hello instead (again every 3 s while it does not answer, each
+    with a new key), to the address and through the socket its latest beacon (at most 4 s old)
+    came from; a beacon from a new address moves the device. It joins under the receiver's
+    computer name when that is free. Removing it also unpairs it, so adding it again pairs again.
+- Impact: new `link.rs`, `pair.rs`, `inject.rs` (lib) and `receiver.rs` (bin); `keymap::inject`;
+  `clip::read_frames`, `clip::decode`, `clip::get` shared with the receiver; `windows` feature
+  `Win32_Security_Cryptography`. Android side and proto unchanged. The receiver's inbound ports
+  need the firewall prompt accepted (private network).
+- Hardening after an independent review of the change (all on the receiver unless noted):
+  - The clipboard listener takes a connection only from the address the session's Hello came from
+    (anyone else would have replaced the controlling PC's connection), and only then starts its
+    threads.
+  - A pairing is pinned to the address of its PairRequest: Nonce and Confirm from elsewhere are
+    ignored, so a host that saw the tag cannot hijack or stall it. A finished pairing (accepted or
+    declined here) stays until the timeout to answer the controlling PC's retransmits.
+  - Queries are answered only from private or link-local IPv4 addresses (the beacon is bigger
+    than the query).
+  - TabState replies stop 3 s after the last packet from a controlling PC that left while it had
+    control. Clips decoded out of order (a big image, then text) never overwrite a newer one.
+    Opening the tray menu first releases what the controlling PC holds (the menu stops the loop).
+  - A Yes to a pairing question that was meanwhile cancelled or timed out says "Not paired" (both
+    PCs). On the controlling PC, a beacon from a new address moves a receiver only once it stopped
+    answering (beacons are not authenticated).
+  - Accepted limits: a LAN host can keep a receiver busy with PairRequests (one question per
+    120 s) or answer in place of a quiet receiver, which stalls but never pairs or injects; a user
+    who says Yes without comparing codes can pair with an attacker, as with Bluetooth; a
+    receiver answering from another of its addresses than the one queried cannot pair.
+- Verification (logic only, as asked: no second PC at hand): `cargo.exe test -p wadisplay-pc` 31
+  passed, new: `link` (`messages_round_trip`, `session_round_trip`, `paired_ini_round_trip`,
+  `confirm_answers_only_under_its_key_and_direction`), `pair` (`both_sides_agree_and_a_middleman_does_not`
+  with real CNG keys, `sha256_known_answer`), `inject` (`session_rebases_and_enters`,
+  `keys_and_buttons_change_and_release`, `return_needs_a_push_out_of_the_facing_edge`) and
+  `keymap::inject` inverting `usage`; `cargo test` (proto 5, server 10) passes; release build
+  without warnings. The pairing and session state machines were walked through by hand and by an
+  independent review, whose findings are fixed above. Untested live: discovery through Windows
+  Firewall, pairing, SendInput on a receiver, the role switch restart, the clipboard between PCs.

@@ -111,40 +111,57 @@ fn connect(name: &str, ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emi
         .ok()?;
     let _ = c.set_nodelay(true);
     let _ = c.set_write_timeout(Some(Duration::from_secs(2)));
-    let (mut r, key, rx_seq, name) = (c.try_clone().ok()?, *key, rx_seq.clone(), name.to_string());
-    std::thread::spawn(move || {
-        let mut len = [0; 4];
-        while r.read_exact(&mut len).is_ok() {
-            let n = u32::from_le_bytes(len) as usize;
-            if n > proto::MAX_SEALED {
-                break;
-            }
-            let mut b = vec![0; n];
-            if r.read_exact(&mut b).is_err() {
-                break;
-            }
-            let mut seq = rx_seq.load(Relaxed);
-            let Some(c) = proto::open_bytes(&key, proto::DIR_TAB_CLIP, &b, &mut seq).filter(|c| proto::clip_ok(c)) else {
-                log!("clipboard: dropped a frame that does not authenticate");
-                continue;
-            };
-            rx_seq.store(seq, Relaxed);
-            log!("clipboard: {} from {name}", proto::clip_desc(&c));
-            // Decoding takes a while for big images: here, not on the main thread.
-            match (c[0], c[1..].to_vec()) {
-                (proto::CLIP_TEXT, t) => match String::from_utf8(t) {
-                    Ok(t) => emit(Clip::Text(t.replace("\r\n", "\n").replace('\n', "\r\n"))),
-                    Err(_) => log!("clipboard: {name} text is not UTF-8"),
-                },
-                (_, file) => match image::dib(&file) {
-                    Ok(dib) => emit(Clip::Image { dib, png: file.starts_with(b"\x89PNG").then_some(file) }),
-                    Err(e) => log!("clipboard: {name} image: {e}"),
-                },
-            }
+    let (r, key, rx_seq, name) = (c.try_clone().ok()?, *key, rx_seq.clone(), name.to_string());
+    std::thread::spawn(move || read_frames(r, |b| {
+        let mut seq = rx_seq.load(Relaxed);
+        let Some(c) = proto::open_bytes(&key, proto::DIR_TAB_CLIP, &b, &mut seq).filter(|c| proto::clip_ok(c)) else {
+            return log!("clipboard: dropped a frame that does not authenticate");
+        };
+        rx_seq.store(seq, Relaxed);
+        // Decoding takes a while for big images: here, not on the main thread.
+        if let Some(c) = decode(&c, &name) {
+            emit(c);
         }
-    });
+    }));
     log!("clipboard: connected to {addr}");
     Some(c)
+}
+
+/// Reads `proto::frame`s until the connection ends or announces more than `proto::MAX_SEALED`.
+pub fn read_frames(mut r: TcpStream, mut f: impl FnMut(Vec<u8>)) {
+    let mut len = [0; 4];
+    while r.read_exact(&mut len).is_ok() {
+        let n = u32::from_le_bytes(len) as usize;
+        if n > proto::MAX_SEALED {
+            break;
+        }
+        let mut b = vec![0; n];
+        if r.read_exact(&mut b).is_err() {
+            break;
+        }
+        f(b);
+    }
+}
+
+/// A clip received from `from` (kind byte and data, `proto::clip_ok`), ready for this PC's clipboard.
+pub fn decode(c: &[u8], from: &str) -> Option<Clip> {
+    log!("clipboard: {} from {from}", proto::clip_desc(c));
+    match (c[0], c[1..].to_vec()) {
+        (proto::CLIP_TEXT, t) => match String::from_utf8(t) {
+            Ok(t) => Some(Clip::Text(t.replace("\r\n", "\n").replace('\n', "\r\n"))),
+            Err(_) => {
+                log!("clipboard: {from} text is not UTF-8");
+                None
+            }
+        },
+        (_, file) => match image::dib(&file) {
+            Ok(dib) => Some(Clip::Image { dib, png: file.starts_with(b"\x89PNG").then_some(file) }),
+            Err(e) => {
+                log!("clipboard: {from} image: {e}");
+                None
+            }
+        },
+    }
 }
 
 /// Closes the clipboard when dropped.
@@ -183,7 +200,7 @@ unsafe fn data(format: u32) -> Option<Vec<u8>> {
 /// This PC's clip: text (LF line ends), else an image as PNG. Unless `share_private`, None when
 /// the app that set it asked clipboard monitors to skip it (password managers do, with
 /// ExcludeClipboardContentFromMonitorProcessing).
-fn get(share_private: bool) -> Option<Vec<u8>> {
+pub fn get(share_private: bool) -> Option<Vec<u8>> {
     let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
     let bitmap = {
         let _open = open(None)?;

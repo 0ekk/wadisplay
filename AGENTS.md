@@ -10,7 +10,10 @@ over Wi-Fi, native Android pointer). Design, decisions and per-milestone verific
   NKRO keyboard (`uhid.rs`), entry warp (`warp.rs`), daemon/UDP/timeouts and the clipboard relay
   (TCP to the PC, pipes to the helper) (`main.rs`).
 - `pc/`: `wadisplay.exe` (Windows, elevated via manifest). Hooks/Raw Input/cursor parking (`capture.rs`),
-  adb deploy/launch (`adb.rs`), tray (`tray.rs`), arrange window (`arrange.rs`), clipboard sync (`clip.rs`). Pure logic (`switch.rs`, `keymap.rs`, `remote.rs`, `devices.rs`: the device list, kinds and names) and the
+  adb deploy/launch (`adb.rs`), tray (`tray.rs`), arrange window (`arrange.rs`), clipboard sync (`clip.rs`),
+  receiver mode, controlled by another PC (`receiver.rs`). Pure logic (`switch.rs`, `keymap.rs`, `remote.rs`,
+  `devices.rs`: the device list, kinds and names; `link.rs`: PC to PC discovery, pairing and `paired.ini`;
+  `inject.rs`: PcState to input on a receiver), the CNG pairing crypto (`pair.rs`) and the
   WIC image conversions (`image.rs`) are the lib, so
   tests never link the requireAdministrator manifest. `build.rs` links the manifest and `icon/*.png`
   (as a hand-written `.res`) into the exe.
@@ -63,6 +66,10 @@ Windows `adb.exe` reads stdin in text mode (byte 0x1A ends it) and turns LF into
   connected by hand) joins by itself unless it was removed before; one on USB is switched to
   `adb tcpip 5555`. For each device it connects adb to `<ip>:5555`, tells its kind and serial
   number, deploys the server/APK when their hashes change and launches the server.
+- PC receivers: on the second PC, tray > "Be controlled by another PC" (saves `role=receive` and
+  restarts; allow wadisplay through the firewall when Windows asks). The controlling PC finds it on
+  the LAN and both PCs ask whether their 6-digit codes match; once both say yes it joins like a
+  device (`paired.ini` holds the keys). Removing it unpairs it.
 - Latency bench: `wadisplay.exe --bench [seconds]` (default 60; result in a message box and the log).
 - Tablet side: `adb -s <tablet-ip>:5555 shell cat /data/local/tmp/wadisplay.log`.
 

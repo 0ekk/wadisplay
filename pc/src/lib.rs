@@ -2,7 +2,11 @@
 pub mod devices;
 #[cfg(windows)]
 pub mod image;
+pub mod inject;
 pub mod keymap;
+pub mod link;
+#[cfg(windows)]
+pub mod pair;
 pub mod remote;
 pub mod switch;
 

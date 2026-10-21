@@ -1,5 +1,5 @@
 //! Notification-area icon: tooltip status and a menu (arrange devices, private clipboard text,
-//! Connect/Disconnect, Quit).
+//! Connect/Disconnect, the receiver role, Quit), and notifications.
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
@@ -13,6 +13,10 @@ pub const CMD_CONNECT: u32 = 1;
 pub const CMD_QUIT: u32 = 2;
 pub const CMD_ARRANGE: u32 = 3;
 pub const CMD_KEEP_PRIVATE: u32 = 5;
+/// Switch between controlling devices and being controlled by another PC (restarts the exe).
+pub const CMD_ROLE: u32 = 6;
+pub const CMD_UNPAIR: u32 = 7;
+const ROLE: PCWSTR = w!("Be controlled by another PC");
 
 /// The tray picture; values are icon group ids in the exe (build.rs).
 #[derive(Clone, Copy)]
@@ -76,7 +80,7 @@ pub fn remove(hwnd: HWND) {
     unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &data(hwnd)); }
 }
 
-/// Shows the menu at the cursor; returns the chosen CMD_* (0 = dismissed).
+/// The controlling PC's menu.
 pub fn menu(hwnd: HWND, status: &str, connected: bool, keep_private: bool) -> u32 {
     unsafe {
         let Ok(m) = CreatePopupMenu() else { return 0 };
@@ -88,12 +92,34 @@ pub fn menu(hwnd: HWND, status: &str, connected: bool, keep_private: bool) -> u3
                             CMD_KEEP_PRIVATE as usize, w!("Keep private clipboard text on this PC"));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(m, MF_STRING, CMD_CONNECT as usize, if connected { w!("Disconnect") } else { w!("Connect") });
+        let _ = AppendMenuW(m, MF_STRING, CMD_ROLE as usize, ROLE);
         let _ = AppendMenuW(m, MF_STRING, CMD_QUIT as usize, w!("Quit"));
-        let mut p = POINT::default();
-        let _ = GetCursorPos(&mut p);
-        let _ = SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None);
-        let _ = DestroyMenu(m);
-        cmd.0 as u32
+        track(hwnd, m)
     }
+}
+
+/// The receiver's menu: status, the role (checked), unpair, Quit.
+pub fn receiver_menu(hwnd: HWND, status: &str, paired: bool) -> u32 {
+    unsafe {
+        let Ok(m) = CreatePopupMenu() else { return 0 };
+        let status = HSTRING::from(status);
+        let _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, PCWSTR(status.as_ptr()));
+        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(m, MF_STRING | MF_CHECKED, CMD_ROLE as usize, ROLE);
+        let _ = AppendMenuW(m, MF_STRING | if paired { MF_ENABLED } else { MF_GRAYED }, CMD_UNPAIR as usize,
+                            w!("Unpair all PCs"));
+        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(m, MF_STRING, CMD_QUIT as usize, w!("Quit"));
+        track(hwnd, m)
+    }
+}
+
+/// Shows the menu at the cursor; returns the chosen CMD_* (0 = dismissed).
+unsafe fn track(hwnd: HWND, m: HMENU) -> u32 {
+    let mut p = POINT::default();
+    let _ = GetCursorPos(&mut p);
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None);
+    let _ = DestroyMenu(m);
+    cmd.0 as u32
 }

@@ -77,9 +77,53 @@ pub fn usage(scan: u32, ext: bool, vk: u32) -> u8 {
     }
 }
 
+/// How a receiver PC injects a HID usage with SendInput.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Inject {
+    /// A set-1 scancode, E0-extended or not.
+    Scan(u16, bool),
+    /// A virtual key (Pause and NumLock, which have no plain scancode), extended or not.
+    Vk(u16, bool),
+}
+
+/// The inverse of `usage`.
+pub fn inject(u: u8) -> Option<Inject> {
+    match u {
+        0 => return None,
+        0x48 => return Some(Inject::Vk(0x13, false)), // Pause
+        0x53 => return Some(Inject::Vk(0x90, true)),  // NumLock
+        0x46 => return Some(Inject::Scan(0x37, true)), // PrintScreen, not SysRq (Alt+PrintScreen)
+        _ => {}
+    }
+    [false, true].into_iter().flat_map(|ext| (1..0x80).map(move |s| (s, ext)))
+        .find(|&(s, ext)| usage(s, ext, 0) == u)
+        .map(|(s, ext)| Inject::Scan(s as u16, ext))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::usage;
+    use super::{inject, usage, Inject};
+
+    #[test]
+    fn inject_inverts_usage() {
+        assert_eq!(inject(0x04), Some(Inject::Scan(0x1E, false))); // A
+        assert_eq!(inject(0xE4), Some(Inject::Scan(0x1D, true))); // right Ctrl
+        assert_eq!(inject(0x58), Some(Inject::Scan(0x1C, true))); // keypad Enter
+        assert_eq!(inject(0x48), Some(Inject::Vk(0x13, false))); // Pause
+        assert_eq!(inject(0x46), Some(Inject::Scan(0x37, true))); // PrintScreen
+        assert_eq!(inject(0), None);
+        assert_eq!(inject(0x03), None, "no key");
+        for ext in [false, true] {
+            for s in 1..0x80 {
+                let u = usage(s, ext, 0);
+                if let Some(Inject::Scan(s2, e2)) = inject(u) {
+                    assert_eq!(usage(s2 as u32, e2, 0), u, "{s:#x} {ext}");
+                } else {
+                    assert_eq!(u, 0, "{s:#x} {ext} unmapped");
+                }
+            }
+        }
+    }
 
     #[test]
     fn common_keys() {

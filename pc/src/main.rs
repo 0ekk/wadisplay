@@ -7,21 +7,22 @@ mod adb;
 mod arrange;
 mod capture;
 mod clip;
+mod receiver;
 mod tray;
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use wadisplay_proto::{self as proto, Msg, PcState, Side, TabState};
+use wadisplay_proto::{self as proto, hex, unhex, Msg, PcState, Side, TabState};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThread, ProcessPowerThrottling,
@@ -32,6 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use capture::Raw;
 use wadisplay_pc::devices::{self, Device, Kind};
+use wadisplay_pc::link::{self, Id, Link, Paired, Public, Session, Tag};
+use wadisplay_pc::pair::{self, KeyPair};
 use wadisplay_pc::remote::Remote;
 use wadisplay_pc::switch::{self, Action, Rect, Switch};
 
@@ -51,6 +54,8 @@ struct Settings {
     remote_step: i32,
     /// Share clipboard text that its app marked private (password managers); off by default.
     share_private: bool,
+    /// Be controlled by another PC (`receiver.rs`) instead.
+    receive: bool,
 }
 
 const DEFAULT_INI: &str = "\
@@ -63,6 +68,8 @@ push_counts=20
 remote_step=200
 # clipboard text that password managers mark private: keep (on this PC) or share. The tray menu also sets it.
 private_clipboard=keep
+# control: share this PC's mouse and keyboard with devices; receive: be controlled by another PC. The tray menu also sets it.
+role=control
 ";
 
 /// wadisplay.ini keys from before devices.ini: moved there on the first start that finds them.
@@ -80,7 +87,7 @@ impl Settings {
             let _ = std::fs::write(&path, DEFAULT_INI);
             DEFAULT_INI.into()
         });
-        let mut c = Settings { adb: "adb".into(), push_counts: 20, remote_step: 200, share_private: false };
+        let mut c = Settings { adb: "adb".into(), push_counts: 20, remote_step: 200, share_private: false, receive: false };
         let (mut old, mut had_old, mut kept) = (<[String; 4]>::default(), false, vec![]);
         for line in text.lines().filter(|l| !l.trim_start().starts_with(['#', ';'])) {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -90,6 +97,7 @@ impl Settings {
                 "push_counts" => c.push_counts = v.parse().unwrap_or(c.push_counts),
                 "remote_step" => c.remote_step = v.parse().unwrap_or(c.remote_step),
                 "private_clipboard" => c.share_private = v == "share",
+                "role" => c.receive = v == "receive",
                 k => {
                     match OLD_KEYS.iter().position(|o| *o == k) {
                         Some(i) => (old[i], had_old) = (v.into(), true),
@@ -100,8 +108,8 @@ impl Settings {
             }
             kept.push((k, v));
         }
-        log!("config {}: push {} remote step {} adb {} private clipboard {}", path.display(), c.push_counts,
-             c.remote_step, c.adb, if c.share_private { "share" } else { "keep" });
+        log!("config {}: push {} remote step {} adb {} private clipboard {} role {}", path.display(), c.push_counts,
+             c.remote_step, c.adb, if c.share_private { "share" } else { "keep" }, if c.receive { "receive" } else { "control" });
         let (devices, ignored) = match std::fs::read_to_string(devices_path()) {
             Ok(t) => devices::parse(&t),
             Err(_) => {
@@ -195,6 +203,37 @@ fn win_rect(r: Rect) -> RECT {
     RECT { left: r.l, top: r.t, right: r.r, bottom: r.b }
 }
 
+fn computer_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into())
+}
+
+/// Saves the role and starts a new wadisplay.exe, which waits for this one to quit.
+fn restart_as(role: &str) {
+    log!("switching to role {role}");
+    Settings::save("role", role);
+    if let Err(e) = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--restart").spawn()) {
+        log!("restart: {e}");
+    }
+}
+
+/// Discovery sockets, one per local IPv4 address: a broadcast leaves only through the interface of
+/// the address its socket is bound to.
+/// ponytail: broadcast only, so a receiver PC on another subnet is not found.
+fn link_sockets() -> Vec<UdpSocket> {
+    let ips: Vec<Ipv4Addr> = (computer_name().as_str(), 0).to_socket_addrs().into_iter().flatten()
+        .filter_map(|a| match a.ip() {
+            IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+            _ => None,
+        })
+        .collect();
+    let ips = if ips.is_empty() { vec![Ipv4Addr::UNSPECIFIED] } else { ips };
+    ips.into_iter().filter_map(|ip| {
+        let s = UdpSocket::bind((ip, 0)).map_err(|e| log!("discovery on {ip}: {e}")).ok()?;
+        let _ = s.set_broadcast(true);
+        Some(s)
+    }).collect()
+}
+
 enum Ev {
     /// Raw Input mouse: relative counts, or absolute 0..65535 coordinates.
     Mouse(i32, i32, bool),
@@ -221,6 +260,10 @@ enum Ev {
     Adb(usize, adb::Event),
     /// A clip from that device.
     Clip(usize, clip::Clip),
+    /// A discovery or pairing message, from a receiver PC, on that discovery socket.
+    Link(Vec<u8>, SocketAddr, usize),
+    /// This user's answer to the pairing code.
+    PairAnswer(Tag, bool),
 }
 
 static TX: OnceLock<Sender<Ev>> = OnceLock::new();
@@ -316,6 +359,35 @@ impl Peer {
     }
 }
 
+/// A receiver PC's latest answer to discovery.
+struct Beacon {
+    nonce: [u8; 16],
+    public: Public,
+    name: String,
+    from: SocketAddr,
+    /// The discovery socket it came in on.
+    via: usize,
+    at: Instant,
+}
+
+/// Pairing with a receiver PC (`link.rs`): request, its commitment, both nonces, both users' answers.
+struct PairC {
+    id: Id,
+    name: String,
+    to: SocketAddr,
+    via: usize,
+    kp: KeyPair,
+    public: Public,
+    theirs: Public,
+    nc: [u8; 16],
+    commit: Option<[u8; 32]>,
+    nr: Option<[u8; 16]>,
+    key: [u8; 32],
+    mine: Option<bool>,
+    started: Instant,
+    sent_at: Option<Instant>,
+}
+
 struct App {
     hwnd: HWND,
     hider: HWND,
@@ -328,6 +400,15 @@ struct App {
     /// The adb watcher, and when it last switched each serial to adb over Wi-Fi.
     watch: Sender<adb::Tcpip>,
     tcpip_at: HashMap<String, Instant>,
+    /// This PC's id and the receiver PCs it paired with (paired.ini).
+    me: Id,
+    paired: Vec<Paired>,
+    links: Vec<UdpSocket>,
+    query_at: Option<Instant>,
+    beacons: HashMap<Id, Beacon>,
+    pairing: Option<PairC>,
+    /// Receiver PCs whose pairing was declined or timed out: not asked again until Add or a restart.
+    declined: Vec<Id>,
     /// Input state; each device gets it with `active` set only for the one in control.
     st: PcState,
     remote: Remote,
@@ -507,13 +588,25 @@ impl App {
                 if !p.cfg.dev.id.is_empty() && !self.ignored.contains(&p.cfg.dev.id) {
                     self.ignored.push(p.cfg.dev.id.clone());
                 }
+                // A removed PC is forgotten: adding it again pairs again.
+                if let Some(id) = unhex::<16>(&p.cfg.dev.id).filter(|_| p.cfg.dev.kind == Kind::Pc) {
+                    self.paired.retain(|q| q.id != id);
+                    receiver::save_paired(&self.me, &self.paired);
+                }
                 arrange::note(format!("Removed {}.", p.cfg.dev.name));
                 self.save_devices();
                 self.tip_at = now;
             }
             Ev::Add(ip) => match self.peers.iter().find(|p| p.cfg.dev.ip == ip) {
                 Some(p) => arrange::note(format!("{ip} is already here, as {}.", p.cfg.dev.name)),
-                None => {
+                None => if let Some((&id, b)) = self.beacons.iter().find(|(_, b)| b.from.ip().to_string() == ip) {
+                    // A receiver PC: its next beacon pairs (or joins) it, removed or declined before or not.
+                    log!("arrange: adding {} ({ip})", b.name);
+                    arrange::note(format!("{} ({ip}) is a PC: it joins once both PCs confirm the pairing code.", b.name));
+                    self.ignored.retain(|i| *i != hex(&id));
+                    self.declined.retain(|d| *d != id);
+                    self.save_devices();
+                } else {
                     log!("arrange: adding {ip}");
                     let adb = self.settings.adb.clone();
                     std::thread::spawn(move || {
@@ -531,7 +624,7 @@ impl App {
                     return;
                 }
                 self.ignored.retain(|i| *i != id); // added by hand: it may join by itself again
-                let d = self.join_new(kind, id, ip, now);
+                let d = self.join_new(kind, id, ip, "", now);
                 arrange::note(format!("Added {} on the {} edge. Drag it to where it sits.", d.name, d.side.name()));
             }
             Ev::Found(f) => self.on_found(f, now),
@@ -550,7 +643,193 @@ impl App {
                     clip::set(self.hwnd, &c, &self.peers[i].clip_last);
                 }
             }
+            Ev::Link(b, from, via) => self.on_link(&b, from, via, now),
+            Ev::PairAnswer(tag, yes) => {
+                let Some(p) = self.pairing.as_mut().filter(|p| link::tag(&p.public) == tag && p.mine.is_none()) else {
+                    if yes {
+                        tray::notify(self.hwnd, "Not paired", "That pairing was cancelled or timed out.");
+                    }
+                    return;
+                };
+                log!("pairing: {} {}", p.name, if yes { "accepted here" } else { "declined here" });
+                if yes {
+                    (p.mine, p.sent_at) = (Some(true), None);
+                    return self.pair_tick(now);
+                }
+                let m = Link::Confirm { tag, sealed: link::confirm(&p.key, link::DIR_CONFIRM_PC, false) }.encode();
+                for _ in 0..3 {
+                    let _ = self.links[p.via].send_to(&m, p.to);
+                }
+                self.declined.push(p.id);
+                self.pairing = None;
+            }
         }
+    }
+
+    fn on_link(&mut self, b: &[u8], from: SocketAddr, via: usize, now: Instant) {
+        let m = Link::decode(b);
+        if let Some(Link::Beacon { id, nonce, public, name }) = m {
+            return self.on_beacon(id, Beacon { nonce, public, name, from, via, at: now }, now);
+        }
+        let Some(p) = self.pairing.as_mut().filter(|p| p.to == from) else { return };
+        let tag = link::tag(&p.public);
+        match m {
+            Some(Link::Commit { tag: t, commit }) if t == tag && p.commit.is_none() => {
+                (p.commit, p.sent_at) = (Some(commit), None);
+                self.pair_tick(now); // our nonce, now
+            }
+            Some(Link::Reveal { tag: t, nonce: nr }) if t == tag && p.commit.is_some() && p.nr.is_none() => {
+                let z = p.kp.agree(&p.theirs);
+                let Some(z) = z.filter(|_| p.commit == Some(pair::commit(&p.theirs, &p.public, &nr))) else {
+                    log!("pairing with {}: its nonce does not match its commitment, stopped", p.name);
+                    self.pairing = None;
+                    return;
+                };
+                let (code, key) = pair::derive(&z, &p.public, &p.theirs, &p.nc, &nr);
+                (p.nr, p.key) = (Some(nr), key);
+                let text = receiver::code_question(&format!("{} ({}) can be controlled from this PC.", p.name, from.ip()), code);
+                std::thread::spawn(move || emit_wake(Ev::PairAnswer(tag, receiver::ask(&text))));
+            }
+            Some(Link::Confirm { tag: t, sealed }) if t == tag && p.mine == Some(true) => {
+                match link::confirmed(&p.key, link::DIR_CONFIRM_RX, &sealed) {
+                    Some(true) => self.paired_with(now),
+                    Some(false) => {
+                        log!("pairing: {} declined there", p.name);
+                        self.declined.push(p.id);
+                        self.pairing = None;
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A receiver PC answered discovery: pair with it if it is new, follow it to a new address.
+    fn on_beacon(&mut self, id: Id, b: Beacon, now: Instant) {
+        let (hid, ip, name) = (hex(&id), b.from.ip().to_string(), b.name.clone());
+        self.beacons.insert(id, b);
+        if self.paused || id == self.me || self.ignored.contains(&hid) {
+            return;
+        }
+        if !self.paired.iter().any(|p| p.id == id) {
+            if self.pairing.is_none() && !self.declined.contains(&id) {
+                log!("pairing with {name} at {ip}");
+                let (b, kp) = (&self.beacons[&id], KeyPair::new());
+                self.pairing = Some(PairC { id, name, to: b.from, via: b.via, public: kp.public(), kp, theirs: b.public,
+                                            nc: pair::random(), commit: None, nr: None, key: [0; 32], mine: None,
+                                            started: now, sent_at: None });
+                self.pair_tick(now);
+            }
+            return;
+        }
+        match self.peers.iter().position(|p| p.cfg.dev.id == hid) {
+            // Beacons are not authenticated: one from elsewhere moves a receiver only once it went quiet.
+            Some(i) if self.peers[i].cfg.dev.ip != ip && !self.peers[i].answering(now) => self.move_peer(i, ip, now),
+            Some(_) => {}
+            None => {
+                let d = self.join_new(Kind::Pc, hid, ip, &name, now);
+                self.notify_joined(&d);
+            }
+        }
+    }
+
+    /// Sends the pairing's next message, again every 500 ms until the receiver answers.
+    fn pair_tick(&mut self, now: Instant) {
+        let Some(p) = &mut self.pairing else { return };
+        if now - p.started > receiver::PAIR_TIMEOUT {
+            // Not asked again by itself: its question may still be open on either PC.
+            log!("pairing with {} timed out; Add it by IP to try again", p.name);
+            self.declined.push(p.id);
+            self.pairing = None;
+            return;
+        }
+        if p.sent_at.is_some_and(|t| now - t < Duration::from_millis(500)) {
+            return;
+        }
+        let tag = link::tag(&p.public);
+        let m = match (p.commit, p.nr, p.mine) {
+            (None, ..) => Link::PairRequest { id: self.me, public: p.public, name: computer_name() },
+            (Some(_), None, _) => Link::Nonce { tag, nonce: p.nc },
+            (_, Some(_), Some(true)) => Link::Confirm { tag, sealed: link::confirm(&p.key, link::DIR_CONFIRM_PC, true) },
+            _ => return, // this user has not answered yet
+        };
+        p.sent_at = Some(now);
+        let _ = self.links[p.via].send_to(&m.encode(), p.to);
+    }
+
+    /// Both users confirmed: the receiver joins (its session starts on the next tick).
+    fn paired_with(&mut self, now: Instant) {
+        let Some(p) = self.pairing.take() else { return };
+        log!("paired with {}", p.name);
+        self.paired.retain(|q| q.id != p.id);
+        self.paired.push(Paired { id: p.id, name: p.name.clone(), key: p.key });
+        receiver::save_paired(&self.me, &self.paired);
+        if !self.peers.iter().any(|q| q.cfg.dev.id == hex(&p.id)) {
+            let d = self.join_new(Kind::Pc, hex(&p.id), p.to.ip().to_string(), &p.name, now);
+            self.notify_joined(&d);
+        }
+    }
+
+    /// Starts a session with receiver PC `i`: a fresh key, sealed with the paired key and bound to
+    /// its latest beacon. It then answers like an Android server.
+    fn hello(&mut self, i: usize, now: Instant) {
+        let p = &mut self.peers[i];
+        let id = unhex::<16>(&p.cfg.dev.id);
+        let b = id.and_then(|id| self.beacons.get(&id)).filter(|b| now - b.at < Duration::from_secs(4));
+        let k = id.and_then(|id| self.paired.iter().find(|q| q.id == id));
+        let (Some(b), Some(k)) = (b, k) else {
+            p.adb_status = match k {
+                None => "not paired: remove it, then add it again".into(),
+                Some(_) => format!("{} not found: is wadisplay running there, set to be controlled?", p.cfg.dev.name),
+            };
+            return;
+        };
+        let key = pair::random();
+        let s = Session { nonce: b.nonce, key, side: p.cfg.dev.side, push_counts: p.cfg.push_counts };
+        // A random sequence number: hellos under one paired key never share a nonce.
+        let seq = u64::from_le_bytes(pair::random()).max(1);
+        let m = Link::Hello { id: self.me, sealed: proto::seal_bytes(&k.key, link::DIR_HELLO, seq, &s.encode()) };
+        let _ = self.links[b.via].send_to(&m.encode(), b.from);
+        (p.key, p.rx_seq, p.dirty) = (Some(key), 0, true);
+        let _ = p.clip.send(clip::Cmd::Key(key));
+        p.adb_status = format!("waiting for {}", p.cfg.dev.name);
+    }
+
+    /// (Re)starts device `i`'s server, or its session for a PC.
+    fn launch(&mut self, i: usize, now: Instant) {
+        self.peers[i].launch_at = Some(now);
+        if self.peers[i].cfg.dev.kind == Kind::Pc {
+            return self.hello(i, now);
+        }
+        let p = &mut self.peers[i];
+        let cfg = p.cfg.clone();
+        let _ = p.launch.send(match p.server_pid {
+            Some(pid) => adb::Request::Revive(cfg, pid),
+            None => {
+                p.adb_status = "connecting over adb".into();
+                adb::Request::Launch(cfg)
+            }
+        });
+    }
+
+    fn notify_joined(&self, d: &Device) {
+        tray::notify(self.hwnd, &format!("{} joined", d.name),
+                     &format!("On the {} edge. Arrange devices (tray menu) moves, renames or removes it.", d.side.name()));
+    }
+
+    /// Its socket and clipboard connection go to the old address: a new peer in its place.
+    fn move_peer(&mut self, i: usize, ip: String, now: Instant) {
+        let mut d = self.peers[i].cfg.dev.clone();
+        log!("{} moved from {} to {ip}", d.name, d.ip);
+        d.ip = ip;
+        self.bye(i);
+        self.peers.remove(i);
+        self.add_peer(d, now);
+        let p = self.peers.pop().unwrap();
+        self.peers.insert(i, p);
+        self.save_devices();
+        self.tip_at = now;
     }
 
     fn on_adb(&mut self, i: usize, e: adb::Event, now: Instant) {
@@ -672,20 +951,23 @@ impl App {
         if self.remote.tick(now_ms(), &mut self.st.keys) {
             self.touch();
         }
-        for p in &mut self.peers {
+        if !self.paused && self.query_at.map_or(true, |t| now - t >= Duration::from_secs(2)) {
+            self.query_at = Some(now);
+            for s in &self.links {
+                let _ = s.send_to(&Link::Query.encode(), (Ipv4Addr::BROADCAST, link::CONTROL_PORT));
+            }
+        }
+        self.pair_tick(now);
+        for i in 0..self.peers.len() {
+            let p = &self.peers[i];
+            // A PC session needs only a datagram, a server takes adb a while.
+            let retry = Duration::from_secs(if p.cfg.dev.kind == Kind::Pc { 3 } else { 10 });
             let silent = p.heard.map_or(true, |t| now - t > Duration::from_secs(3));
-            if !self.paused && silent && p.launch_at.map_or(true, |t| now - t > Duration::from_secs(10)) {
-                p.launch_at = Some(now);
-                let cfg = p.cfg.clone();
-                let _ = p.launch.send(match p.server_pid {
-                    Some(pid) => adb::Request::Revive(cfg, pid),
-                    None => {
-                        p.adb_status = "connecting over adb".into();
-                        adb::Request::Launch(cfg)
-                    }
-                });
+            if !self.paused && silent && p.launch_at.map_or(true, |t| now - t > retry) {
+                self.launch(i, now);
             }
 
+            let p = &mut self.peers[i];
             let every = Duration::from_millis(if p.sw.active { 30 } else { 1000 });
             if !self.paused && (p.dirty || now - p.last_send >= every) {
                 self.st.sent_us = now_us();
@@ -763,9 +1045,11 @@ impl App {
         save_devices(&self.peers.iter().map(|p| p.cfg.dev.clone()).collect::<Vec<_>>(), &self.ignored);
     }
 
-    /// Adds a device under its kind's default name, on the edge with fewest devices; saved.
-    fn join_new(&mut self, kind: Kind, id: String, ip: String, now: Instant) -> Device {
-        let name = devices::default_name(kind, self.peers.iter().map(|p| p.cfg.dev.name.as_str()));
+    /// Adds a device under `name`, or its kind's default name if that is empty or taken, on the edge
+    /// with fewest devices; saved.
+    fn join_new(&mut self, kind: Kind, id: String, ip: String, name: &str, now: Instant) -> Device {
+        let names = || self.peers.iter().map(|p| p.cfg.dev.name.as_str());
+        let name = devices::check_name(name, names()).unwrap_or_else(|_| devices::default_name(kind, names()));
         let (side, pos) = devices::place(&self.peers.iter().map(|p| (p.cfg.dev.side, p.cfg.dev.pos)).collect::<Vec<_>>());
         log!("added {name} ({}) {ip} on the {}", kind.label(), side.name());
         let d = Device { name, kind, id, ip, side, pos };
@@ -802,17 +1086,7 @@ impl App {
                     self.save_devices();
                 }
                 if let Some(ip) = ip {
-                    // Its socket and clipboard connection go to the old address: a new peer in its place.
-                    let mut d = self.peers[i].cfg.dev.clone();
-                    log!("{} moved from {} to {ip}", d.name, d.ip);
-                    d.ip = ip;
-                    self.bye(i);
-                    self.peers.remove(i);
-                    self.add_peer(d, now);
-                    let p = self.peers.pop().unwrap();
-                    self.peers.insert(i, p);
-                    self.save_devices();
-                    self.tip_at = now;
+                    self.move_peer(i, ip, now);
                 }
                 if tcpip {
                     let ip = self.peers[i].cfg.dev.ip.clone();
@@ -826,9 +1100,8 @@ impl App {
                              "A device on USB has no Wi-Fi connection: connect it to Wi-Fi, then plug it in again.");
             }
             devices::Join::Add { ip, tcpip } => {
-                let d = self.join_new(s.kind, s.id.clone(), ip, now);
-                tray::notify(self.hwnd, &format!("{} joined", d.name),
-                             &format!("On the {} edge. Arrange devices (tray menu) moves, renames or removes it.", d.side.name()));
+                let d = self.join_new(s.kind, s.id.clone(), ip, "", now);
+                self.notify_joined(&d);
                 if tcpip {
                     self.tcpip(&s.serial, &d.ip, now);
                 }
@@ -857,7 +1130,9 @@ impl App {
             }
         });
         let (launch, launch_rx) = mpsc::channel();
-        std::thread::spawn(move || adb::thread(launch_rx, |e| emit_wake(Ev::Adb(id, e))));
+        if cfg.dev.kind != Kind::Pc {
+            std::thread::spawn(move || adb::thread(launch_rx, |e| emit_wake(Ev::Adb(id, e))));
+        }
         let (clip, clip_rx) = mpsc::channel();
         let clip_last = clip::Last::default();
         let (name, ip, last, share_private) = (cfg.dev.name.clone(), cfg.dev.ip.clone(), clip_last.clone(), self.share_private);
@@ -898,7 +1173,9 @@ impl App {
         if moved {
             p.sw = Switch::new(side, p.cfg.push_counts); // offline until the new server answers
         }
-        if moved && !self.paused {
+        if moved && !self.paused && p.cfg.dev.kind == Kind::Pc {
+            self.launch(i, Instant::now());
+        } else if moved && !self.paused {
             p.launch_at = Some(Instant::now());
             p.adb_status = format!("restarting the {} server", p.cfg.dev.name);
             let _ = p.launch.send(adb::Request::Launch(p.cfg.clone()));
@@ -928,6 +1205,11 @@ impl App {
                 self.bye_all();
                 self.paused = true;
                 log!("disconnected from the tray");
+            }
+            tray::CMD_ROLE => {
+                self.bye_all();
+                restart_as("receive");
+                self.quit = true;
             }
             tray::CMD_QUIT => {
                 self.bye_all();
@@ -971,9 +1253,25 @@ fn run(settings: Settings, devices: Vec<Device>, ignored: Vec<String>) {
     let adb_path = settings.adb.clone();
     std::thread::spawn(move || adb::watch(&adb_path, watch_rx, |f| emit_wake(Ev::Found(f))));
 
+    let links = link_sockets();
+    for (i, s) in links.iter().enumerate() {
+        let s = s.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 512];
+            loop {
+                match s.recv_from(&mut b) {
+                    Ok((n, from)) => emit_wake(Ev::Link(b[..n].to_vec(), from, i)),
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+    }
+    let (me, paired) = receiver::load_paired();
+
     let now = Instant::now();
     let mut app = App {
-        hwnd, hider, peers: vec![], next_id: 0, ignored, watch, tcpip_at: HashMap::new(), st: PcState::default(), remote: Remote::new(settings.remote_step), park: None,
+        hwnd, hider, peers: vec![], next_id: 0, ignored, watch, tcpip_at: HashMap::new(), me, paired, links, query_at: None,
+        beacons: HashMap::new(), pairing: None, declined: vec![], st: PcState::default(), remote: Remote::new(settings.remote_step), park: None,
         blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None, key_balance: 0,
         hook_seen: capture::HOOK_KEYS.load(Relaxed), balance_since: None, share_private: settings.share_private, settings,
         paused: false, tip_at: now, stats_at: now, quit: false,
@@ -1063,10 +1361,21 @@ fn main() {
         unsafe { let _ = ClipCursor(None); } // never leave the cursor pinned to the edge
         log!("panic: {info}");
     }));
+    let restart = std::env::args().any(|a| a == "--restart");
     unsafe {
-        let _ = CreateMutexW(None, true, w!("Local\\wadisplay"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            return message_box("wadisplay is already running.");
+        // A restart (role switch) waits up to 10 s for the old instance to quit.
+        for n in 0.. {
+            let m = CreateMutexW(None, true, w!("Local\\wadisplay"));
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                break;
+            }
+            if let Ok(m) = m {
+                let _ = CloseHandle(m);
+            }
+            if !restart || n == 50 {
+                return message_box("wadisplay is already running.");
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
         timeBeginPeriod(1);
         let s = PROCESS_POWER_THROTTLING_STATE { Version: 1, ControlMask: 1, StateMask: 0 }; // EXECUTION_SPEED off
@@ -1082,6 +1391,7 @@ fn main() {
                                args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(60)),
             None => message_box("No device to measure: add one in the arrange window first."),
         },
+        None if settings.receive => receiver::run(settings.share_private),
         None => run(settings, devices, ignored),
     }
 }
