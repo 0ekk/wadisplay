@@ -79,9 +79,10 @@ pub fn side_at(x: i32, y: i32, r: Rect) -> Side {
     }
 }
 
-/// A `w`×`h` box centered on `side` of `r`, `gap` away from it.
-pub fn beside(side: Side, w: i32, h: i32, gap: i32, r: Rect) -> Rect {
-    let (cx, cy) = ((r.l + r.r - w) / 2, (r.t + r.b - h) / 2);
+/// A `w`×`h` box beside `side` of `r`, `gap` away from it, centered at fraction `pos` along it.
+pub fn beside(side: Side, pos: u16, w: i32, h: i32, gap: i32, r: Rect) -> Rect {
+    let (px, py) = edge_point(side, pos, r);
+    let (cx, cy) = (px - w / 2, py - h / 2);
     let (l, t) = match side {
         Side::Left => (r.l - gap - w, cy),
         Side::Right => (r.r + gap, cy),
@@ -89,6 +90,32 @@ pub fn beside(side: Side, w: i32, h: i32, gap: i32, r: Rect) -> Rect {
         Side::Bottom => (cx, r.b + gap),
     };
     Rect { l, t, r: l + w, b: t + h }
+}
+
+/// The stretch `(a, b)` of an edge that a device at `pos` on it owns, given where the others on that
+/// edge sit: up to halfway to each neighbour, the whole edge when alone.
+pub fn span(pos: u16, others: impl IntoIterator<Item = u16>) -> (u16, u16) {
+    let (mut a, mut b) = (0, 65535);
+    for o in others {
+        let mid = ((o as u32 + pos as u32) / 2) as u16;
+        if o < pos {
+            a = a.max(mid + 1);
+        } else if o > pos {
+            b = b.min(mid);
+        }
+    }
+    (a, b)
+}
+
+/// Fraction `f` along the whole edge as a fraction along the stretch `(a, b)` (the device's own
+/// edge), clamped to it.
+pub fn into_span(f: u16, (a, b): (u16, u16)) -> u16 {
+    ((f.clamp(a, b) - a) as u32 * 65535 / (b - a).max(1) as u32) as u16
+}
+
+/// The inverse: a fraction along the device's edge as one along the whole edge.
+pub fn from_span(f: u16, (a, b): (u16, u16)) -> u16 {
+    a + (f as u32 * (b - a) as u32 / 65535) as u16
 }
 
 pub struct Switch {
@@ -208,12 +235,32 @@ mod tests {
         assert_eq!(side_at(-100, 720, R), Side::Left);
         assert_eq!(side_at(2600, 100, R), Side::Right);
         assert_eq!(side_at(1280, -50, R), Side::Top);
-        let b = beside(Side::Left, 800, 500, 100, R);
+        let b = beside(Side::Left, 32768, 800, 500, 100, R);
         assert_eq!((b.l, b.t, b.r, b.b), (-900, 470, -100, 970));
+        let b = beside(Side::Top, 0, 800, 500, 100, R);
+        assert_eq!((b.l, b.t, b.r, b.b), (-400, -600, 400, -100), "centered on the corner");
         for s in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
-            let b = beside(s, 800, 500, 100, R);
-            assert_eq!(side_at((b.l + b.r) / 2, (b.t + b.b) / 2, R), s);
+            let b = beside(s, 20000, 800, 500, 100, R);
+            let (cx, cy) = ((b.l + b.r) / 2, (b.t + b.b) / 2);
+            assert_eq!(side_at(cx, cy, R), s);
+            assert!(along(s, cx, cy, R).abs_diff(20000) < 50, "{s:?}");
         }
+    }
+
+    #[test]
+    fn spans_split_an_edge_between_its_devices() {
+        assert_eq!(span(10000, []), (0, 65535), "alone: the whole edge");
+        assert_eq!(span(10000, [30000]), (0, 20000));
+        assert_eq!(span(30000, [10000]), (20001, 65535), "neighbours never overlap");
+        assert_eq!(span(30000, [10000, 50000, 60000]), (20001, 40000));
+        assert_eq!(into_span(20000, (0, 20000)), 65535);
+        assert_eq!(into_span(20001, (20001, 65535)), 0);
+        assert_eq!(into_span(65535, (0, 20000)), 65535, "clamped");
+        assert_eq!(into_span(500, (500, 500)), 0, "empty stretch");
+        for f in [0, 1, 12345, 65535] {
+            assert!(into_span(from_span(f, (20001, 40000)), (20001, 40000)).abs_diff(f) <= 4);
+        }
+        assert_eq!((from_span(0, (20001, 40000)), from_span(65535, (20001, 40000))), (20001, 40000));
     }
 
     #[test]

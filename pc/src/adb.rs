@@ -1,5 +1,6 @@
-//! adb thread, one per device: connect (re-arming `adb tcpip` over USB after a tablet reboot),
-//! deploy the embedded server and companion APK when their hashes change, launch the server.
+//! adb thread, one per device: connect (re-arming `adb tcpip` over USB after a device reboot),
+//! tell its kind, deploy the embedded server and companion APK when their hashes change, launch the
+//! server.
 
 use std::io::Write;
 use std::os::windows::process::CommandExt;
@@ -7,7 +8,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use wadisplay_proto::hex;
+use wadisplay_pc::devices::{Device, Kind};
+use wadisplay_proto::{hex, Side};
 
 use crate::{log, Config};
 
@@ -20,6 +22,8 @@ static APK: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
                                            "/../android/app/build/outputs/apk/debug/app-debug.apk"));
 const PKG: &str = "com.wadisplay.companion";
 const DIR: &str = "/data/local/tmp";
+/// Its output tells the kind (`Kind::android`).
+const KIND_CMD: &str = "getprop ro.build.characteristics; pm has-feature android.software.leanback; wm size; wm density";
 
 pub enum Request {
     /// Start a server, replacing any.
@@ -38,8 +42,8 @@ impl Request {
 }
 
 pub enum Event {
-    /// The server runs with this key and pid.
-    Launched([u8; 32], u32),
+    /// The server runs with this key and pid, on a device of this kind.
+    Launched([u8; 32], u32, Kind),
     /// Revive found the server still running.
     Running,
     Failed(String),
@@ -87,6 +91,9 @@ impl Adb<'_> {
             if self.online() {
                 return Ok(());
             }
+            if self.run(&["devices"]).unwrap_or_default().contains(&format!("{}\tunauthorized", self.serial)) {
+                return Err(format!("{}: allow USB debugging from this PC on the device's screen", self.serial));
+            }
             let _ = self.run(&["disconnect", &self.serial]);
             // After a tablet reboot adbd only listens on USB: switch it to TCP once.
             let devices = self.run(&["devices"]).unwrap_or_default();
@@ -97,7 +104,7 @@ impl Adb<'_> {
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
-        let n = self.cfg.name;
+        let n = &self.cfg.dev.name;
         Err(format!("cannot reach {} over adb ({n} off Wi-Fi while asleep? After a {n} reboot, plug in USB once)", self.serial))
     }
 
@@ -152,8 +159,9 @@ impl Adb<'_> {
         Ok(self.shell(&format!("grep -qs wadisplay-server /proc/{pid}/cmdline && echo alive || echo gone"))? == "alive")
     }
 
-    fn launch(&self) -> Result<([u8; 32], u32), String> {
+    fn launch(&self) -> Result<([u8; 32], u32, Kind), String> {
         self.connect()?;
+        let kind = Kind::android(&self.shell(KIND_CMD)?);
         self.deploy()?;
         let (mut key, mut token) = ([0u8; 32], [0u8; 16]);
         getrandom::fill(&mut key).and_then(|_| getrandom::fill(&mut token)).map_err(|e| e.to_string())?;
@@ -163,7 +171,7 @@ impl Adb<'_> {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| e.to_string())?;
-        let line = format!("{} {} {} {}\n", hex(&key), hex(&token), self.cfg.side.name(), self.cfg.push_counts);
+        let line = format!("{} {} {} {}\n", hex(&key), hex(&token), self.cfg.dev.side.name(), self.cfg.push_counts);
         child.stdin.take().unwrap().write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         let o = child.wait_with_output().map_err(|e| e.to_string())?;
         let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
@@ -171,17 +179,26 @@ impl Adb<'_> {
             return Err(format!("server did not start: {}", out.trim()));
         };
         log!("{}", out.trim());
-        Ok((key, pid))
+        Ok((key, pid, kind))
     }
 }
 
 fn adb(cfg: &Config) -> Adb<'_> {
-    Adb { serial: format!("{}:5555", cfg.ip), cfg }
+    Adb { serial: format!("{}:5555", cfg.dev.ip), cfg }
 }
 
-/// Connects, deploys and starts the server; returns its key and pid.
-pub fn launch(cfg: &Config) -> Result<([u8; 32], u32), String> {
+/// Connects, deploys and starts the server; returns its key and pid, and the device's kind.
+pub fn launch(cfg: &Config) -> Result<([u8; 32], u32, Kind), String> {
     adb(cfg).launch()
+}
+
+/// Connects to a device about to be added and tells its kind.
+pub fn probe(adb_path: &str, ip: &str) -> Result<Kind, String> {
+    let cfg = Config { dev: Device { name: "device".into(), kind: Kind::Tablet, ip: ip.into(), side: Side::Left, pos: 0 },
+                       adb: adb_path.into(), push_counts: 0 };
+    let a = adb(&cfg);
+    a.connect()?;
+    Ok(Kind::android(&a.shell(KIND_CMD)?))
 }
 
 /// Serves requests until the channel closes. Requests queued meanwhile are dropped, unless the
@@ -198,13 +215,13 @@ pub fn thread(rx: Receiver<Request>, emit: impl Fn(Event)) {
         emit(match running {
             Ok(true) => Event::Running,
             Ok(false) => match launch(&cfg) {
-                Ok((key, pid)) => Event::Launched(key, pid),
+                Ok((key, pid, kind)) => Event::Launched(key, pid, kind),
                 Err(e) => Event::Failed(e),
             },
             Err(e) => Event::Failed(e),
         });
         next = match rx.try_iter().last() {
-            Some(r) if r.cfg().side != cfg.side => Some(r),
+            Some(r) if r.cfg().dev.side != cfg.dev.side => Some(r),
             _ => rx.recv().ok(),
         };
     }

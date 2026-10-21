@@ -856,3 +856,85 @@ under "Open checks".
   window is not the cause (misses predate it). Open: find what sends those raw key events.
   With the TV asleep (adb could not reach it) and the tablet awake, the user saw only the tablet in
   the arrange window and only the tablet's latency line in the tray tooltip.
+
+### Many devices: names, kinds, several per edge, auto-join, PCs (2026-10-21, plan)
+- Request from the user: any number of devices; their kind (tablet, phone, TV, PC) recognised by
+  itself; renamed for easier management, no two with the same name.
+- Decisions (user-confirmed, from the options offered): PCs are controllable too; several devices
+  may share one edge; renaming is a double-click in the arrange window; devices are added there
+  with an "Add device" field (IP address) and also join by themselves; offline devices stay in the
+  arrange window, greyed, so they can still be renamed, moved or removed (this replaces "only
+  devices that answer are shown").
+- Findings: the tablet's `ro.build.characteristics` is `tablet` and adb reads its `ro.serialno`. Its
+  adbd in TCP mode advertises nothing over mDNS (`adb mdns services` is empty), so Android devices
+  cannot be found on the LAN through adb; they join over USB instead.
+- Milestones, each stopped for the user to try and committed on its own:
+  - **D1 device list** (PC only): `devices.ini`, any number of Android devices, kind detection,
+    rename, add by IP, remove, several per edge.
+  - **D2 Android auto-join** (PC only): an authorised device seen by adb (USB, or connected over
+    TCP by hand) joins: `adb tcpip 5555` and its Wi-Fi IP when on USB, kind, default name, a tray
+    notification. A removed device is remembered and does not join again unless added by IP.
+  - **D3 PC receivers**: `wadisplay.exe` switched by a tray toggle to "be controlled by another
+    PC". The receiver announces itself on the LAN; the controlling PC offers to pair it; both
+    screens show the same 6-digit code from an ECDH (Windows CNG, P-256) exchange and both users
+    confirm, since a receiver takes injected input and must not pair with whoever asks. Input
+    through `SendInput`, entry by `SetCursorPos`, the same TabState replies, clipboard over the
+    same TCP framing.
+
+### D1 device list (2026-10-21)
+- Decisions:
+  - `devices.ini` (next to `wadisplay.ini`) holds the devices, one `[device]` section each with
+    `name`, `kind`, `ip`, `side` and `pos` (percent along the edge). The exe rewrites it whole on
+    every change, so `wadisplay.ini` keeps only the shared settings (`adb`, `push_counts`,
+    `remote_step`, `private_clipboard`). On the first start without `devices.ini`, `tablet_ip`/`side`
+    and `tv_ip`/`tv_side` become devices "Tablet" and "TV" and `wadisplay.ini` is rewritten from the
+    defaults with the values of the keys still read. A section without an IP is skipped; a bad or
+    repeated name gets its kind's default.
+  - Kind (`devices::Kind`): tablet, phone, TV, PC. adb runs
+    `getprop ro.build.characteristics; pm has-feature android.software.leanback; wm size; wm density`
+    on every launch: TV if it has the leanback (TV UI) feature or `tv` in its characteristics, else
+    tablet if `tablet` is there or its smallest width is at least 600 dp, else phone. A change is
+    saved.
+  - Names: trimmed, 1 to 32 characters, no control characters, unique ignoring case
+    (`devices::check_name`, checked in the window and again by `App`). The default is the kind's
+    label, numbered from 2 when taken ("Tablet 2"). Names are UTF-8, so Chinese names work; the
+    main loop now calls `TranslateMessage` so the fields get characters and IME input.
+  - Each device has a stable `Peer::id` for the exe's lifetime; thread events carry it, since adding
+    and removing shift indices. A removed device's UDP reader thread stays blocked in `recv`
+    (marked `ponytail:`); its adb and clipboard threads end with their channels.
+  - Several devices per edge: the online devices on one edge split it halfway between neighbouring
+    positions (`switch::span`); one alone owns the whole edge, as before. Crossing uses the stretch
+    the cursor is on, mapped onto the device's whole edge (`into_span`), and a return maps back
+    (`from_span`); the server and the wire format are unchanged. An offline device's stretch goes
+    to its online neighbours. The hotkey enters the nearest edge's device that owns the stretch
+    facing the cursor.
+  - Arrange window: boxes shaped by kind (TV 16:9, PC 16:10, tablet 3:2, phone portrait), placed at
+    their `pos`; a drop picks the side as before and `pos` from the box centre. Dropping on an
+    occupied edge no longer swaps: the devices share it. Only a side change restarts the server. A
+    press becomes a drag past the system drag threshold, so a click does not move the box.
+    Double-click (or right-click > Rename) opens a name field over the box: Enter or clicking away
+    keeps the name, Esc cancels, a refused name is explained in the hint line. Right-click > Remove
+    asks on its own thread (a modal box on the main thread would stall input to the devices), then
+    sends Bye and drops the device. The bottom row is an IP field and "Add device": the PC checks
+    the address is IPv4 and new, connects adb from a thread, reads the kind and adds the device
+    with its default name on the edge with fewest devices (`devices::place`); errors (unreachable,
+    "allow USB debugging") show in the hint line. Offline devices are grey with ", offline". With
+    no devices the window opens at start; the start-up message box asking for `tablet_ip` and the
+    "same edge" refusal are gone.
+  - The manifest adds Common Controls 6 (current-style fields, placeholder text); the `windows`
+    crate gains the `Win32_UI_Controls` feature for `EM_SETCUEBANNER` and friends.
+- Impact: PC only; no protocol, server or APK change. Existing settings move to `devices.ini` once.
+  `--bench` measures the first device. Log lines name devices without "the".
+- Verification so far: `cargo.exe test -p wadisplay-pc` 18 passed (new: `android_kinds` in the shape
+  adb.exe prints, `ini_round_trip`, `ini_repairs_names_and_skips_devices_without_ip`,
+  `names`, `placing_new_devices`, `spans_split_an_edge_between_its_devices`, positioned `beside`);
+  `cargo test` (proto 5, server 10) passes; release build without warnings.
+- Live, by the user (log): the first start moved `tablet_ip`/`tv_ip` into `devices.ini` as Tablet
+  (left) and TV (right); dragging the offline TV along the right edge saved 18%, 54%, 51% without
+  restarting anything; renames to an English name, to a Chinese one and back were saved and logged.
+- Found while renaming: "keyboard hook missed ... reinstalling hooks" about once per key typed into
+  the name field with the Chinese IME (68 in 30 s). Raw Input reports key events that software
+  injects (here most likely the IME, typing into our elevated window), and the low-level hook did
+  not see them. Fix: only key events with a device (`RAWINPUTHEADER.hDevice` set) count towards
+  "hooks lost"; injected ones have none. Dead hooks still show, since hardware keys reach Raw
+  Input either way. This may also explain the earlier bursts with no typing at all.

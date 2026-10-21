@@ -1,4 +1,5 @@
 //! Pure parts of the PC side, unit-tested without building the elevated exe.
+pub mod devices;
 #[cfg(windows)]
 pub mod image;
 pub mod keymap;

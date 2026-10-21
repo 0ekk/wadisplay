@@ -30,6 +30,8 @@ pub enum Cmd {
     Enter,
     /// Whether clips marked private (password managers) are shared too.
     SharePrivate(bool),
+    /// The device was renamed (for the log).
+    Name(String),
 }
 
 /// A clip from the tablet, ready for this PC's clipboard.
@@ -44,7 +46,7 @@ pub enum Clip {
 pub type Last = Arc<AtomicU32>;
 
 /// Owns the connection. Tablet clips arrive through `emit`, from a reader thread.
-pub fn thread(name: &'static str, ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool,
+pub fn thread(mut name: String, ip: String, rx: Receiver<Cmd>, last: Last, mut share_private: bool,
               emit: impl Fn(Clip) + Send + Clone + 'static) {
     let mut key: Option<([u8; 32], Arc<AtomicU64>)> = None;
     let mut conn: Option<TcpStream> = None;
@@ -54,9 +56,10 @@ pub fn thread(name: &'static str, ip: String, rx: Receiver<Cmd>, last: Last, mut
             Cmd::Key(k) => {
                 close(&mut conn);
                 (key, tx_seq) = (Some((k, Arc::new(AtomicU64::new(0)))), 0);
-                conn = connect(name, &ip, key.as_ref().unwrap(), emit.clone());
+                conn = connect(&name, &ip, key.as_ref().unwrap(), emit.clone());
             }
             Cmd::SharePrivate(v) => share_private = v,
+            Cmd::Name(n) => name = n,
             Cmd::Enter => {
                 let Some(k) = &key else { continue };
                 let seq = unsafe { GetClipboardSequenceNumber() };
@@ -72,7 +75,7 @@ pub fn thread(name: &'static str, ip: String, rx: Receiver<Cmd>, last: Last, mut
                 // A connection that died quietly fails on write: reconnect and send once more.
                 for _ in 0..2 {
                     if conn.is_none() {
-                        conn = connect(name, &ip, k, emit.clone());
+                        conn = connect(&name, &ip, k, emit.clone());
                     }
                     let Some(s) = &mut conn else { break };
                     tx_seq += 1; // spent even if the write fails: a nonce is never reused
@@ -80,7 +83,7 @@ pub fn thread(name: &'static str, ip: String, rx: Receiver<Cmd>, last: Last, mut
                     // In pieces, so the 2 s write timeout means "no progress", not "all of an image".
                     match f.chunks(64 << 10).try_for_each(|p| s.write_all(p)) {
                         Ok(()) => {
-                            log!("clipboard: {} to the {name}", proto::clip_desc(&c));
+                            log!("clipboard: {} to {name}", proto::clip_desc(&c));
                             break;
                         }
                         Err(e) => {
@@ -100,7 +103,7 @@ fn close(conn: &mut Option<TcpStream>) {
     }
 }
 
-fn connect(name: &'static str, ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(Clip) + Send + 'static)
+fn connect(name: &str, ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU64>), emit: impl Fn(Clip) + Send + 'static)
            -> Option<TcpStream> {
     let addr = (ip, proto::CLIP_PORT).to_socket_addrs().ok()?.next()?;
     let c = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
@@ -108,7 +111,7 @@ fn connect(name: &'static str, ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU6
         .ok()?;
     let _ = c.set_nodelay(true);
     let _ = c.set_write_timeout(Some(Duration::from_secs(2)));
-    let (mut r, key, rx_seq) = (c.try_clone().ok()?, *key, rx_seq.clone());
+    let (mut r, key, rx_seq, name) = (c.try_clone().ok()?, *key, rx_seq.clone(), name.to_string());
     std::thread::spawn(move || {
         let mut len = [0; 4];
         while r.read_exact(&mut len).is_ok() {
@@ -126,7 +129,7 @@ fn connect(name: &'static str, ip: &str, (key, rx_seq): &([u8; 32], Arc<AtomicU6
                 continue;
             };
             rx_seq.store(seq, Relaxed);
-            log!("clipboard: {} from the {name}", proto::clip_desc(&c));
+            log!("clipboard: {} from {name}", proto::clip_desc(&c));
             // Decoding takes a while for big images: here, not on the main thread.
             match (c[0], c[1..].to_vec()) {
                 (proto::CLIP_TEXT, t) => match String::from_utf8(t) {

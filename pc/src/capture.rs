@@ -199,8 +199,10 @@ pub fn read_raw(lp: LPARAM) -> Option<Raw> {
             let m = unsafe { ri.data.mouse };
             Some(Raw::Mouse { x: m.lLastX, y: m.lLastY, absolute: m.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 })
         }
-        // VKey 0xFF: the second half of E1 sequences (Pause), which hooks never see.
-        t if t == RIM_TYPEKEYBOARD.0 && unsafe { ri.data.keyboard.VKey } != 0xFF => Some(Raw::Key),
+        // VKey 0xFF: the second half of E1 sequences (Pause), which hooks never see. No device:
+        // injected by software (an IME typing into our own window, say), which this elevated
+        // process's hooks need not see either; only keyboards count towards "hooks lost".
+        t if t == RIM_TYPEKEYBOARD.0 && unsafe { ri.data.keyboard.VKey } != 0xFF && !ri.header.hDevice.is_invalid() => Some(Raw::Key),
         _ => None,
     }
 }
