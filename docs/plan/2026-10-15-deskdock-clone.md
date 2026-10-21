@@ -498,8 +498,8 @@ under "Open checks".
   - History: all 8 commits were rewritten with `git filter-branch --tree-filter` (the same `sed`
     replacements in every commit) and `--commit-filter 'git commit-tree -S'`, so every commit stays
     GPG-signed with its original author, dates and message. Nothing had been pushed: GitHub held
-    only its own `LICENSE` commit. The pre-rewrite history is kept locally under `refs/original/`
-    (not pushed by `git push` or `--all`).
+    only its own `LICENSE` commit. The pre-rewrite history was kept locally under `refs/original/`
+    (never pushed) until 2026-10-21, when it was deleted and its reflog entries pruned.
   - Commit author name and email unchanged (user choice).
 - Impact: commit ids changed; first start without `tablet_ip` asks for it.
 - Verification: in each rewritten commit only `AGENTS.md`, this file and `pc/src/main.rs` differ from
