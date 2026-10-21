@@ -118,11 +118,11 @@ impl Settings {
                 let mut v = vec![];
                 if !old[0].is_empty() {
                     v.push(Device { name: "Tablet".into(), kind: Kind::Tablet, id: String::new(), ip: old[0].clone(),
-                                    side: side(&old[1], Side::Left), pos: 32768 });
+                                    side: side(&old[1], Side::Left), pos: 32768, enabled: true });
                 }
                 if !old[2].is_empty() {
                     v.push(Device { name: "TV".into(), kind: Kind::Tv, id: String::new(), ip: old[2].clone(),
-                                    side: side(&old[3], Side::Right), pos: 32768 });
+                                    side: side(&old[3], Side::Right), pos: 32768, enabled: true });
                 }
                 save_devices(&v, &[]);
                 (v, vec![])
@@ -246,10 +246,11 @@ enum Ev {
     Remote,
     DesktopSwitch,
     Tray(u32),
-    /// The arrange window moved, renamed, added or removed a device. These and the rest carry the
-    /// device's `Peer::id`, unique while the exe runs.
+    /// The arrange window moved, renamed, enabled or disabled, added or removed a device. These and
+    /// the rest carry the device's `Peer::id`, unique while the exe runs.
     Arrange(usize, Side, u16),
     Rename(usize, String),
+    Enable(usize, bool),
     Remove(usize),
     /// Add the device at this IP address, once adb reaches it (`Probed`).
     Add(String),
@@ -579,6 +580,21 @@ impl App {
                     Err(e) => arrange::note(e),
                 }
             }
+            Ev::Enable(id, on) => {
+                let Some(i) = self.index(id).filter(|&i| self.peers[i].cfg.dev.enabled != on) else { return };
+                if !on {
+                    self.bye(i);
+                }
+                let p = &mut self.peers[i];
+                log!("arrange: {} {}", p.cfg.dev.name, if on { "enabled" } else { "disabled" });
+                p.cfg.dev.enabled = on;
+                // Offline at once: no edge, stretch or hotkey for it until its server answers.
+                (p.sw, p.launch_at) = (Switch::new(p.cfg.dev.side, p.cfg.push_counts), None);
+                p.adb_status = if on { "starting" } else { "disabled" }.into();
+                arrange::note(format!("{} {}.", if on { "Enabled" } else { "Disabled" }, p.cfg.dev.name));
+                self.save_devices();
+                self.tip_at = now;
+            }
             Ev::Remove(id) => {
                 let Some(i) = self.index(id) else { return };
                 self.bye(i);
@@ -833,6 +849,14 @@ impl App {
     }
 
     fn on_adb(&mut self, i: usize, e: adb::Event, now: Instant) {
+        if !self.peers[i].cfg.dev.enabled {
+            // Disabled while adb was launching: stop the server it started.
+            if let adb::Event::Launched(key, ..) = e {
+                self.peers[i].key = Some(key);
+                self.bye(i);
+            }
+            return;
+        }
         match e {
             adb::Event::Launched(key, pid, kind, id) => {
                 let p = &mut self.peers[i];
@@ -963,7 +987,7 @@ impl App {
             // A PC session needs only a datagram, a server takes adb a while.
             let retry = Duration::from_secs(if p.cfg.dev.kind == Kind::Pc { 3 } else { 10 });
             let silent = p.heard.map_or(true, |t| now - t > Duration::from_secs(3));
-            if !self.paused && silent && p.launch_at.map_or(true, |t| now - t > retry) {
+            if !self.paused && p.cfg.dev.enabled && silent && p.launch_at.map_or(true, |t| now - t > retry) {
                 self.launch(i, now);
             }
 
@@ -1037,7 +1061,8 @@ impl App {
         let online = |p: &Peer| !self.paused && p.heard.is_some_and(|t| now - t <= Duration::from_secs(10));
         self.peers.iter().map(|p| {
             let d = &p.cfg.dev;
-            arrange::Item { id: p.id, name: d.name.clone(), kind: d.kind, side: d.side, pos: d.pos, online: online(p) }
+            arrange::Item { id: p.id, name: d.name.clone(), kind: d.kind, side: d.side, pos: d.pos, online: online(p),
+                            enabled: d.enabled }
         }).collect()
     }
 
@@ -1052,7 +1077,7 @@ impl App {
         let name = devices::check_name(name, names()).unwrap_or_else(|_| devices::default_name(kind, names()));
         let (side, pos) = devices::place(&self.peers.iter().map(|p| (p.cfg.dev.side, p.cfg.dev.pos)).collect::<Vec<_>>());
         log!("added {name} ({}) {ip} on the {}", kind.label(), side.name());
-        let d = Device { name, kind, id, ip, side, pos };
+        let d = Device { name, kind, id, ip, side, pos, enabled: true };
         self.add_peer(d.clone(), now);
         self.save_devices();
         self.tip_at = now;
@@ -1158,8 +1183,8 @@ impl App {
         }
     }
 
-    /// Moves device `i` to `pos` along `side`, saved. A new side restarts its server (it takes the
-    /// side at launch: warp corner, strip edge).
+    /// Moves device `i` to `pos` along `side`, saved. A new side restarts an enabled device's server
+    /// (it takes the side at launch: warp corner, strip edge).
     fn set_place(&mut self, i: usize, side: Side, pos: u16) {
         let moved = side != self.peers[i].cfg.dev.side;
         if moved {
@@ -1173,9 +1198,10 @@ impl App {
         if moved {
             p.sw = Switch::new(side, p.cfg.push_counts); // offline until the new server answers
         }
-        if moved && !self.paused && p.cfg.dev.kind == Kind::Pc {
+        let relaunch = moved && !self.paused && p.cfg.dev.enabled;
+        if relaunch && p.cfg.dev.kind == Kind::Pc {
             self.launch(i, Instant::now());
-        } else if moved && !self.paused {
+        } else if relaunch {
             p.launch_at = Some(Instant::now());
             p.adb_status = format!("restarting the {} server", p.cfg.dev.name);
             let _ = p.launch.send(adb::Request::Launch(p.cfg.clone()));

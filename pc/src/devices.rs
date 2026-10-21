@@ -136,12 +136,15 @@ pub struct Device {
     pub side: Side,
     /// Where it sits along its edge: its middle, as a fraction (0..=65535) from the left or top end.
     pub pos: u16,
+    /// Off: kept in the list and the arrange window, but its server is not run.
+    pub enabled: bool,
 }
 
 pub const HEADER: &str = "\
 # wadisplay devices, written by wadisplay.exe: the arrange window adds, moves, renames and removes them.
 # Quit wadisplay before editing this file. kind: tablet, phone, tv or pc; id: serial number; side:
-# left, right, top or bottom; pos: where along that edge, in percent from its left or top end.
+# left, right, top or bottom; pos: where along that edge, in percent from its left or top end;
+# enabled: no keeps it here unused.
 # [ignored]: serial numbers of removed devices, which do not join again by themselves.
 ";
 
@@ -166,7 +169,7 @@ pub fn parse(text: &str) -> (Vec<Device>, Vec<String>) {
             in_ignored = line == "[ignored]";
             if line == "[device]" {
                 cur = Some(Device { name: String::new(), kind: Kind::Tablet, id: String::new(), ip: String::new(),
-                                    side: Side::Right, pos: 32768 });
+                                    side: Side::Right, pos: 32768, enabled: true });
             }
             continue;
         }
@@ -186,6 +189,7 @@ pub fn parse(text: &str) -> (Vec<Device>, Vec<String>) {
             "ip" => d.ip = v.into(),
             "side" => d.side = Side::parse(v).unwrap_or(d.side),
             "pos" => d.pos = v.parse::<u32>().map_or(d.pos, |p| (p.min(100) * 65535 / 100) as u16),
+            "enabled" => d.enabled = v != "no",
             _ => {}
         }
     }
@@ -203,8 +207,8 @@ pub fn parse(text: &str) -> (Vec<Device>, Vec<String>) {
 pub fn format(devices: &[Device], ignored: &[String]) -> String {
     let mut s = HEADER.to_string();
     for d in devices {
-        s += &format!("\n[device]\nname={}\nkind={}\nid={}\nip={}\nside={}\npos={}\n", d.name, d.kind.key(), d.id, d.ip,
-                      d.side.name(), percent(d.pos));
+        s += &format!("\n[device]\nname={}\nkind={}\nid={}\nip={}\nside={}\npos={}\nenabled={}\n", d.name, d.kind.key(), d.id,
+                      d.ip, d.side.name(), percent(d.pos), if d.enabled { "yes" } else { "no" });
     }
     if !ignored.is_empty() {
         s += "\n[ignored]\n";
@@ -291,7 +295,7 @@ mod tests {
     }
 
     fn dev(id: &str, ip: &str) -> Device {
-        Device { name: ip.into(), kind: Kind::Tablet, id: id.into(), ip: ip.into(), side: Side::Left, pos: 0 }
+        Device { name: ip.into(), kind: Kind::Tablet, id: id.into(), ip: ip.into(), side: Side::Left, pos: 0, enabled: true }
     }
 
     fn seen(serial: &str, id: &str, ip: Option<&str>, wifi: bool) -> Seen {
@@ -335,13 +339,13 @@ mod tests {
     fn ini_round_trip() {
         let d = vec![
             Device { name: "客厅电视".into(), kind: Kind::Tv, id: "SER7".into(), ip: "192.0.2.7".into(), side: Side::Right,
-                     pos: 65535 },
+                     pos: 65535, enabled: false },
             Device { name: "Tablet".into(), kind: Kind::Tablet, id: String::new(), ip: "192.0.2.8".into(), side: Side::Left,
-                     pos: 32768 },
+                     pos: 32768, enabled: true },
         ];
         let ignored = vec!["SER9".to_string()];
         let text = format(&d, &ignored);
-        assert!(text.contains("pos=100\n") && text.contains("pos=50\n"));
+        assert!(text.contains("pos=100\nenabled=no\n") && text.contains("pos=50\nenabled=yes\n"));
         let (back, ig) = parse(&text);
         assert_eq!(back[0], d[0]);
         assert_eq!((back[1].name.as_str(), back[1].pos), ("Tablet", 32767), "percent steps");
@@ -356,7 +360,7 @@ mod tests {
         let d = parse(text).0;
         let names: Vec<&str> = d.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["TV", "TV 2", "Phone"]);
-        assert_eq!((d[2].side, d[2].pos), (Side::Right, 32768), "defaults");
+        assert_eq!((d[2].side, d[2].pos, d[2].enabled), (Side::Right, 32768, true), "defaults");
     }
 
     #[test]

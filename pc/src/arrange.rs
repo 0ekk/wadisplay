@@ -1,8 +1,8 @@
 //! Arrange window (tray menu "Arrange devices..."): the PC's monitors with the devices around them,
 //! like Windows' display arrangement. Dropping a device moves it to the edge and the place along it
-//! facing the drop; devices may share an edge. Double-click renames, right-click removes, the field
-//! at the bottom adds a device by IP address. Offline devices are grey. Lives on the main thread,
-//! like `App`.
+//! facing the drop; devices may share an edge. Double-click renames, right-click disables, enables or
+//! removes, the field at the bottom adds a device by IP address. Offline devices are grey, disabled
+//! ones pale. Lives on the main thread, like `App`.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
@@ -31,6 +31,7 @@ pub struct Item {
     pub side: Side,
     pub pos: u16,
     pub online: bool,
+    pub enabled: bool,
 }
 
 /// A press on a device box: the grab point's offset from the box and the cursor (desktop px), where
@@ -391,12 +392,17 @@ unsafe fn paint(hwnd: HWND) {
         // The pressed box on top.
         for d in s.devices.iter().filter(|d| Some(d.id) != pressed).chain(s.devices.iter().filter(|d| Some(d.id) == pressed)) {
             let r = l.client(l.device(s, d));
-            let (bg, fg) = if d.online { (0xD77800, 0xFFFFFF) } else { (0xB4B4B4, 0x505050) }; // Windows accent blue, or grey
+            // Windows accent blue, grey, or pale grey.
+            let (bg, fg, state) = match (d.enabled, d.online) {
+                (false, _) => (0xE6E6E6, 0x8C8C8C, ", disabled"),
+                (_, true) => (0xD77800, 0xFFFFFF, ""),
+                _ => (0xB4B4B4, 0x505050, ", offline"),
+            };
             fill(dc, &r, bg);
             let (mid, pad) = ((r.top + r.bottom) / 2, 4);
             let one = DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
             text(dc, RECT { left: r.left + pad, top: r.top, right: r.right - pad, bottom: mid }, fg, &d.name, one | DT_BOTTOM);
-            let kind = if d.online { d.kind.label().to_string() } else { format!("{}, offline", d.kind.label()) };
+            let kind = format!("{}{state}", d.kind.label());
             text(dc, RECT { left: r.left + pad, top: mid, right: r.right - pad, bottom: r.bottom }, fg, &kind, one | DT_TOP);
         }
         (s.devices.is_empty(), s.note.clone())
@@ -406,7 +412,7 @@ unsafe fn paint(hwnd: HWND) {
          IP address below."
     } else {
         "Drag a device to where it sits by the PC; several can share an edge. Double-click a device to rename it, right-click \
-         to remove it. Grey ones are offline."
+         to disable or remove it. Grey ones are offline, pale ones disabled."
     };
     let (color, s) = match &note {
         Some(n) => (GetSysColor(COLOR_WINDOWTEXT), n.as_str()),
@@ -488,12 +494,14 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_RBUTTONUP => {
             let l = Layout::new(h);
-            let Some((id, name)) = S.with_borrow(|s| {
+            let Some((id, name, enabled)) = S.with_borrow(|s| {
                 let id = l.hit(s, l.desk_point(lp))?;
-                Some((id, s.devices.iter().find(|d| d.id == id)?.name.clone()))
+                let d = s.devices.iter().find(|d| d.id == id)?;
+                Some((id, d.name.clone(), d.enabled))
             }) else { return LRESULT(0) };
             let Ok(m) = CreatePopupMenu() else { return LRESULT(0) };
             let _ = AppendMenuW(m, MF_STRING, 1, w!("Rename"));
+            let _ = AppendMenuW(m, MF_STRING, 3, if enabled { w!("Disable") } else { w!("Enable") });
             let _ = AppendMenuW(m, MF_STRING, 2, w!("Remove..."));
             let (x, y) = client_point(lp);
             let mut p = POINT { x, y };
@@ -503,6 +511,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             match cmd.0 {
                 1 => start_rename(h, id),
                 2 => confirm_remove(id, name),
+                3 => emit(Ev::Enable(id, !enabled)),
                 _ => {}
             }
         }

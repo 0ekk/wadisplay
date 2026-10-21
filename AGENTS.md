@@ -61,8 +61,8 @@ Windows `adb.exe` reads stdin in text mode (byte 0x1A ends it) and turns LF into
   (`wadisplay.ini`, created with defaults on first start; `devices.ini`, the device list, written by
   the exe; `wadisplay.log`, rewritten each start). The tray menu opens the arrange window (add a
   device by IP, drag devices to where they sit, several per edge if need be, double-click to
-  rename, right-click to remove; it opens by itself while there are none) and sets whether private
-  clipboard text stays on the PC. A device that shows up in `adb devices` (plugged in by USB, or
+  rename, right-click to disable or remove; it opens by itself while there are none) and sets
+  whether private clipboard text stays on the PC. A device that shows up in `adb devices` (plugged in by USB, or
   connected by hand) joins by itself unless it was removed before; one on USB is switched to
   `adb tcpip 5555`. For each device it connects adb to `<ip>:5555`, tells its kind and serial
   number, deploys the server/APK when their hashes change and launches the server.

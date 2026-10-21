@@ -1052,3 +1052,24 @@ under "Open checks".
   without warnings. The pairing and session state machines were walked through by hand and by an
   independent review, whose findings are fixed above. Untested live: discovery through Windows
   Firewall, pairing, SendInput on a receiver, the role switch restart, the clipboard between PCs.
+
+### Disable a device (2026-10-21)
+- Rationale (user request): a device can be set aside without removing it, so it keeps its name,
+  place and serial number (and a PC its pairing) and comes back with one click.
+- Decisions:
+  - `Device::enabled`, saved as `enabled=yes|no` in each `[device]` section of `devices.ini`; a
+    section without the key is enabled, so existing files keep working.
+  - Arrange window: right-click > Disable / Enable (between Rename and Remove...). A disabled box is
+    pale grey with ", disabled"; it can still be dragged and renamed. The hint line confirms.
+  - Disabling sends Bye (the server stops, a receiver PC ends its session), resets the device's
+    `Switch` so it is offline at once (no edge, stretch or hotkey for it), and the tooltip says
+    "disabled". `App::tick` launches no server or Hello for it, and moving it to another side does
+    not restart one. A server that adb was launching meanwhile is stopped when its `Launched`
+    arrives; its other adb events are ignored. USB auto-join still recognises it (and switches it
+    to adb over Wi-Fi), but it stays disabled.
+  - Enabling clears `launch_at`, so the next tick launches (or revives) its server as usual.
+- Impact: PC only (`devices.rs`, `main.rs`, `arrange.rs`); no protocol, server or APK change.
+- Verification: `cargo.exe test -p wadisplay-pc` 31 passed (`ini_round_trip` now carries a
+  disabled device, `ini_repairs_names_and_skips_devices_without_ip` checks the enabled default);
+  release build without warnings. Live check (by the user): disable a device, see it pale and its
+  server gone, restart wadisplay, enable it again.
