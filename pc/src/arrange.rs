@@ -402,8 +402,8 @@ unsafe fn paint(hwnd: HWND) {
         (s.devices.is_empty(), s.note.clone())
     });
     let help = if empty {
-        "No devices yet: add one by its Wi-Fi IP address below. If it has no adb over Wi-Fi yet, plug it into this PC by USB \
-         first."
+        "No devices yet. Plug a device with USB debugging on into this PC and it joins by itself, or add one by its Wi-Fi \
+         IP address below."
     } else {
         "Drag a device to where it sits by the PC; several can share an edge. Double-click a device to rename it, right-click \
          to remove it. Grey ones are offline."

@@ -59,9 +59,10 @@ Windows `adb.exe` reads stdin in text mode (byte 0x1A ends it) and turns LF into
   the exe; `wadisplay.log`, rewritten each start). The tray menu opens the arrange window (add a
   device by IP, drag devices to where they sit, several per edge if need be, double-click to
   rename, right-click to remove; it opens by itself while there are none) and sets whether private
-  clipboard text stays on the PC. For each device it connects adb to `<ip>:5555` (running
-  `adb tcpip 5555` if a device is on USB), tells its kind, deploys the server/APK when their
-  hashes change and launches the server.
+  clipboard text stays on the PC. A device that shows up in `adb devices` (plugged in by USB, or
+  connected by hand) joins by itself unless it was removed before; one on USB is switched to
+  `adb tcpip 5555`. For each device it connects adb to `<ip>:5555`, tells its kind and serial
+  number, deploys the server/APK when their hashes change and launches the server.
 - Latency bench: `wadisplay.exe --bench [seconds]` (default 60; result in a message box and the log).
 - Tablet side: `adb -s <tablet-ip>:5555 shell cat /data/local/tmp/wadisplay.log`.
 

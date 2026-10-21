@@ -4,8 +4,8 @@
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-                                NIM_MODIFY, NOTIFYICONDATAW};
+use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+                                NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_TRAY: u32 = WM_APP + 10;
@@ -56,6 +56,20 @@ pub fn add(hwnd: HWND, icon: Icon, tip: &str) {
 
 pub fn set(hwnd: HWND, icon: Icon, tip: &str) {
     unsafe { let _ = Shell_NotifyIconW(NIM_MODIFY, &with(hwnd, icon, tip)); }
+}
+
+/// A notification from the tray icon (a toast on Windows 11).
+pub fn notify(hwnd: HWND, title: &str, text: &str) {
+    let mut d = data(hwnd);
+    d.uFlags = NIF_INFO;
+    d.dwInfoFlags = NIIF_INFO;
+    for (dst, src) in d.szInfoTitle.iter_mut().zip(title.encode_utf16().take(63)) {
+        *dst = src;
+    }
+    for (dst, src) in d.szInfo.iter_mut().zip(text.encode_utf16().take(255)) {
+        *dst = src;
+    }
+    unsafe { let _ = Shell_NotifyIconW(NIM_MODIFY, &d); }
 }
 
 pub fn remove(hwnd: HWND) {

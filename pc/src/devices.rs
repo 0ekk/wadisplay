@@ -55,10 +55,83 @@ impl Kind {
     }
 }
 
+/// Prints what `identity` reads: the serial number, the global IPv4 addresses, then the kind.
+pub const IDENTIFY: &str = "getprop ro.serialno; ip -4 -o addr show scope global; echo --; \
+                            getprop ro.build.characteristics; pm has-feature android.software.leanback; wm size; wm density";
+
+/// A device's serial number (adb's USB serial), its LAN address (Wi-Fi or Ethernet, else the first
+/// global one) and its kind, from the output of `IDENTIFY`.
+pub fn identity(out: &str) -> (String, Option<String>, Kind) {
+    let (head, kind) = out.split_once("\n--").unwrap_or((out, ""));
+    let mut lines = head.lines().map(str::trim);
+    let id = lines.next().unwrap_or("").to_string();
+    // `ip -o`: "9: wlan0    inet 192.0.2.5/24 brd ... scope global wlan0\ ..."
+    let addrs: Vec<(&str, &str)> = lines.filter_map(|l| {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        (w.len() > 3 && w[2] == "inet").then(|| (w[1], w[3].split('/').next().unwrap_or("")))
+    }).collect();
+    let ip = addrs.iter().find(|a| a.0.starts_with("wlan") || a.0.starts_with("eth")).or(addrs.first()).map(|a| a.1.to_string());
+    (id, ip, Kind::android(kind.trim_start_matches(['\r', '\n'])))
+}
+
+/// `adb devices` output as (serial, state); emulators left out.
+pub fn adb_devices(out: &str) -> Vec<(&str, &str)> {
+    out.lines().skip(1).filter_map(|l| l.trim().split_once('\t')).filter(|(s, _)| !s.starts_with("emulator-")).collect()
+}
+
+/// An authorised device that just appeared in `adb devices`.
+#[derive(Debug)]
+pub struct Seen {
+    /// The USB serial, or `ip:port` when connected over TCP.
+    pub serial: String,
+    pub id: String,
+    /// Its LAN address, if it has one.
+    pub ip: Option<String>,
+    pub kind: Kind,
+    /// `ip:5555` is connected too: adb over Wi-Fi works.
+    pub wifi: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Join {
+    /// Device `i` of the list: maybe with a new IP (DHCP gave it another) and its serial number to
+    /// fill in; `tcpip` when it needs switching to adb over Wi-Fi.
+    Known { i: usize, ip: Option<String>, id: Option<String>, tcpip: bool },
+    /// Removed earlier: it does not join by itself.
+    Ignored,
+    /// New, but without a LAN address: it cannot be used over Wi-Fi.
+    NoNetwork,
+    Add { ip: String, tcpip: bool },
+}
+
+/// What to do with a device adb just reported. It is a known one if its serial number or LAN
+/// address matches; one on USB, or connected over TCP on a port other than 5555 (wireless
+/// debugging), is switched to adb over Wi-Fi on 5555 unless that already works.
+pub fn join(devices: &[Device], ignored: &[String], s: &Seen) -> Join {
+    let tcp = s.serial.rsplit_once(':');
+    let ip = match tcp {
+        Some((ip, _)) => Some(ip.to_string()),
+        None => s.ip.clone(),
+    };
+    let tcpip = ip.is_some() && !s.wifi && tcp.is_none_or(|(_, port)| port != "5555");
+    let known = devices.iter().position(|d| (!s.id.is_empty() && d.id == s.id) || ip.as_deref() == Some(d.ip.as_str()));
+    match (known, ip) {
+        (Some(i), ip) => {
+            let d = &devices[i];
+            Join::Known { i, ip: ip.filter(|ip| *ip != d.ip), id: (d.id != s.id && !s.id.is_empty()).then(|| s.id.clone()), tcpip }
+        }
+        (None, _) if !s.id.is_empty() && ignored.contains(&s.id) => Join::Ignored,
+        (None, None) => Join::NoNetwork,
+        (None, Some(ip)) => Join::Add { ip, tcpip },
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
     pub name: String,
     pub kind: Kind,
+    /// Its serial number (`ro.serialno`), once adb has read it; tells the device on USB.
+    pub id: String,
     pub ip: String,
     pub side: Side,
     /// Where it sits along its edge: its middle, as a fraction (0..=65535) from the left or top end.
@@ -67,35 +140,49 @@ pub struct Device {
 
 pub const HEADER: &str = "\
 # wadisplay devices, written by wadisplay.exe: the arrange window adds, moves, renames and removes them.
-# Quit wadisplay before editing this file. kind: tablet, phone, tv or pc; side: left, right, top or
-# bottom; pos: where along that edge, in percent from its left or top end.
+# Quit wadisplay before editing this file. kind: tablet, phone, tv or pc; id: serial number; side:
+# left, right, top or bottom; pos: where along that edge, in percent from its left or top end.
+# [ignored]: serial numbers of removed devices, which do not join again by themselves.
 ";
 
 fn percent(pos: u16) -> u32 {
     (pos as u32 * 100 + 32767) / 65535
 }
 
-/// The devices in `devices.ini` text. A section lacking a usable ip is skipped; other missing
-/// values get defaults.
-pub fn parse(text: &str) -> Vec<Device> {
+/// The devices in `devices.ini` text, and the ignored serial numbers. A device lacking an ip is
+/// skipped; other missing values get defaults.
+pub fn parse(text: &str) -> (Vec<Device>, Vec<String>) {
     let mut out: Vec<Device> = vec![];
     let mut cur: Option<Device> = None;
+    let (mut ignored, mut in_ignored) = (vec![], false);
     let push = |d: Option<Device>, out: &mut Vec<Device>| {
         if let Some(d) = d.filter(|d| !d.ip.is_empty()) {
             out.push(d);
         }
     };
     for line in text.lines().map(str::trim).filter(|l| !l.starts_with(['#', ';'])) {
-        if line == "[device]" {
+        if line.starts_with('[') {
             push(cur.take(), &mut out);
-            cur = Some(Device { name: String::new(), kind: Kind::Tablet, ip: String::new(), side: Side::Right, pos: 32768 });
+            in_ignored = line == "[ignored]";
+            if line == "[device]" {
+                cur = Some(Device { name: String::new(), kind: Kind::Tablet, id: String::new(), ip: String::new(),
+                                    side: Side::Right, pos: 32768 });
+            }
             continue;
         }
-        let (Some(d), Some((k, v))) = (cur.as_mut(), line.split_once('=')) else { continue };
+        let Some((k, v)) = line.split_once('=') else { continue };
         let v = v.trim();
+        if in_ignored {
+            if k.trim() == "id" && !v.is_empty() {
+                ignored.push(v.to_string());
+            }
+            continue;
+        }
+        let Some(d) = cur.as_mut() else { continue };
         match k.trim() {
             "name" => d.name = v.into(),
             "kind" => d.kind = Kind::parse(v).unwrap_or(d.kind),
+            "id" => d.id = v.into(),
             "ip" => d.ip = v.into(),
             "side" => d.side = Side::parse(v).unwrap_or(d.side),
             "pos" => d.pos = v.parse::<u32>().map_or(d.pos, |p| (p.min(100) * 65535 / 100) as u16),
@@ -110,14 +197,20 @@ pub fn parse(text: &str) -> Vec<Device> {
             out[i].name = default_name(out[i].kind, others.iter().map(String::as_str));
         }
     }
-    out
+    (out, ignored)
 }
 
-pub fn format(devices: &[Device]) -> String {
+pub fn format(devices: &[Device], ignored: &[String]) -> String {
     let mut s = HEADER.to_string();
     for d in devices {
-        s += &format!("\n[device]\nname={}\nkind={}\nip={}\nside={}\npos={}\n", d.name, d.kind.key(), d.ip, d.side.name(),
-                      percent(d.pos));
+        s += &format!("\n[device]\nname={}\nkind={}\nid={}\nip={}\nside={}\npos={}\n", d.name, d.kind.key(), d.id, d.ip,
+                      d.side.name(), percent(d.pos));
+    }
+    if !ignored.is_empty() {
+        s += "\n[ignored]\n";
+        for id in ignored {
+            s += &format!("id={id}\n");
+        }
     }
     s
 }
@@ -187,23 +280,80 @@ mod tests {
     }
 
     #[test]
+    fn identity_of_a_device() {
+        let out = "SER1\r\n9: wlan0    inet 192.0.2.5/24 brd 192.0.2.255 scope global wlan0\\       valid_lft forever\r\n\
+                   --\r\ntablet\r\nfalse\r\nPhysical size: 1600x2560\r\nPhysical density: 320\r\n";
+        assert_eq!(identity(out), ("SER1".into(), Some("192.0.2.5".into()), Kind::Tablet));
+        // Mobile data first, Wi-Fi second: Wi-Fi wins. No address at all: None.
+        let out = "S\n3: rmnet0 inet 100.64.0.9/30 scope global rmnet0\n5: wlan0 inet 192.0.2.6/24 scope global wlan0\n--\ndefault\n";
+        assert_eq!(identity(out).1.as_deref(), Some("192.0.2.6"));
+        assert_eq!(identity("S\n--\ntv\n"), ("S".into(), None, Kind::Tv));
+    }
+
+    fn dev(id: &str, ip: &str) -> Device {
+        Device { name: ip.into(), kind: Kind::Tablet, id: id.into(), ip: ip.into(), side: Side::Left, pos: 0 }
+    }
+
+    fn seen(serial: &str, id: &str, ip: Option<&str>, wifi: bool) -> Seen {
+        Seen { serial: serial.into(), id: id.into(), ip: ip.map(Into::into), kind: Kind::Phone, wifi }
+    }
+
+    #[test]
+    fn adb_devices_list() {
+        let out = "List of devices attached\r\nSER1\tdevice\r\n192.0.2.5:5555\tdevice\r\nemulator-5554\tdevice\r\n\
+                   SER2\tunauthorized\r\n\r\n";
+        assert_eq!(adb_devices(out), [("SER1", "device"), ("192.0.2.5:5555", "device"), ("SER2", "unauthorized")]);
+        assert_eq!(adb_devices("List of devices attached\n\n"), []);
+    }
+
+    #[test]
+    fn joining() {
+        let list = [dev("A", "192.0.2.1"), dev("", "192.0.2.2")];
+        let ignored = ["R".to_string()];
+        let j = |s: Seen| join(&list, &ignored, &s);
+        // Over TCP, connected by us: known, nothing to do.
+        assert_eq!(j(seen("192.0.2.1:5555", "A", Some("192.0.2.1"), true)), Join::Known { i: 0, ip: None, id: None, tcpip: false });
+        // A known device on USB after a reboot: switched to Wi-Fi; one without a serial number yet gets it.
+        assert_eq!(j(seen("A", "A", Some("192.0.2.1"), false)), Join::Known { i: 0, ip: None, id: None, tcpip: true });
+        assert_eq!(j(seen("B", "B", Some("192.0.2.2"), true)),
+                   Join::Known { i: 1, ip: None, id: Some("B".into()), tcpip: false });
+        // Known by serial number with a new address.
+        assert_eq!(j(seen("A", "A", Some("192.0.2.9"), false)),
+                   Join::Known { i: 0, ip: Some("192.0.2.9".into()), id: None, tcpip: true });
+        // New ones: on USB, over wireless debugging, already on 5555.
+        assert_eq!(j(seen("N", "N", Some("192.0.2.7"), false)), Join::Add { ip: "192.0.2.7".into(), tcpip: true });
+        assert_eq!(j(seen("192.0.2.7:41235", "N", Some("192.0.2.7"), false)), Join::Add { ip: "192.0.2.7".into(), tcpip: true });
+        assert_eq!(j(seen("192.0.2.7:5555", "N", Some("192.0.2.7"), false)), Join::Add { ip: "192.0.2.7".into(), tcpip: false });
+        // Removed earlier; no Wi-Fi; no serial number does not match an empty one.
+        assert_eq!(j(seen("R", "R", Some("192.0.2.8"), false)), Join::Ignored);
+        assert_eq!(j(seen("N", "N", None, false)), Join::NoNetwork);
+        assert_eq!(join(&[dev("", "192.0.2.1")], &[], &seen("X", "", Some("192.0.2.3"), false)),
+                   Join::Add { ip: "192.0.2.3".into(), tcpip: true });
+    }
+
+    #[test]
     fn ini_round_trip() {
         let d = vec![
-            Device { name: "客厅电视".into(), kind: Kind::Tv, ip: "192.0.2.7".into(), side: Side::Right, pos: 65535 },
-            Device { name: "Tablet".into(), kind: Kind::Tablet, ip: "192.0.2.8".into(), side: Side::Left, pos: 32768 },
+            Device { name: "客厅电视".into(), kind: Kind::Tv, id: "SER7".into(), ip: "192.0.2.7".into(), side: Side::Right,
+                     pos: 65535 },
+            Device { name: "Tablet".into(), kind: Kind::Tablet, id: String::new(), ip: "192.0.2.8".into(), side: Side::Left,
+                     pos: 32768 },
         ];
-        let text = format(&d);
+        let ignored = vec!["SER9".to_string()];
+        let text = format(&d, &ignored);
         assert!(text.contains("pos=100\n") && text.contains("pos=50\n"));
-        let back = parse(&text);
+        let (back, ig) = parse(&text);
         assert_eq!(back[0], d[0]);
         assert_eq!((back[1].name.as_str(), back[1].pos), ("Tablet", 32767), "percent steps");
+        assert_eq!(ig, ignored);
+        assert_eq!(parse(&format(&d, &[])).1, Vec::<String>::new());
     }
 
     #[test]
     fn ini_repairs_names_and_skips_devices_without_ip() {
         let text = "[device]\nname=TV\nkind=tv\nip=192.0.2.1\n[device]\nname=tv\nkind=tv\nip=192.0.2.2\n\
                     [device]\nname=Lost\n[device]\nkind=phone\nip=192.0.2.3\nside=nowhere\npos=x\n";
-        let d = parse(text);
+        let d = parse(text).0;
         let names: Vec<&str> = d.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["TV", "TV 2", "Phone"]);
         assert_eq!((d[2].side, d[2].pos), (Side::Right, 32768), "defaults");

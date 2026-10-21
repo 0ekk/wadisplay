@@ -938,3 +938,35 @@ under "Open checks".
   not see them. Fix: only key events with a device (`RAWINPUTHEADER.hDevice` set) count towards
   "hooks lost"; injected ones have none. Dead hooks still show, since hardware keys reach Raw
   Input either way. This may also explain the earlier bursts with no typing at all.
+
+### D2 Android auto-join (2026-10-21)
+- Decisions:
+  - A watcher thread (`adb::watch`) runs `adb devices` every 2 s (polling: `track-devices` frames
+    its output by length, which Windows adb.exe's text-mode stdout may not keep) and reports each
+    serial once per appearance or state change: an authorised one with its serial number, LAN
+    address and kind (`devices::IDENTIFY`, one shell call: `ro.serialno`, `ip -4 -o addr show scope
+    global`, the kind lines), and an unauthorised one for a notification. Emulators are left out.
+  - The LAN address prefers `wlan*` and `eth*` (Ethernet TVs) over other interfaces such as mobile
+    data; a device without one cannot join and gets a notification.
+  - Devices gain an `id` (the serial number) in `devices.ini`, filled in by every launch, by Add
+    and by the watcher. `devices::join` decides, purely: a device is known when its serial number
+    or address matches; a known one on USB with a new address replaces its peer (socket and
+    clipboard connection follow the address); a known or new one on USB, or over TCP on a port
+    other than 5555 (wireless debugging), is switched to `adb tcpip 5555` unless `ip:5555` already
+    works; an unknown one joins with its kind's default name on the edge with fewest devices and
+    a tray notification; a removed one does not.
+  - Remove puts the serial number in an `[ignored]` section of `devices.ini`; Add by IP takes it out
+    again.
+  - Only the watcher switches devices to TCP now: `Adb::connect` lost its "re-arm any USB device"
+    fallback, which with several devices could restart the wrong device's adbd. The watcher
+    connects `ip:5555` 3 s after `tcpip`, and `App::tcpip` sends at most one switch per serial per
+    20 s, since the restarted adbd shows up again over USB before it is connected over TCP.
+  - Tray notifications (`tray::notify`, `NIF_INFO`): joined, no Wi-Fi, allow USB debugging.
+- Impact: PC only. A device plugged in by USB with debugging allowed now joins without asking
+  (the "Allow USB debugging" prompt on the device is the consent); removing it keeps it out.
+- Verification (logic only, no new device at hand): `cargo.exe test -p wadisplay-pc` 21 passed, new:
+  `identity_of_a_device` (the shape the tablet printed for `IDENTIFY`, checked live: serial line,
+  `wlan0` line, `--`, kind lines, CRLF), `adb_devices_list`, `joining` (known over TCP, known on USB
+  after a reboot, serial number filled in, new address, new on USB / wireless debugging / 5555,
+  ignored, no network, empty serial numbers never match). Release build without warnings.
+  Untested live: a device joining, an address change, the notifications.
