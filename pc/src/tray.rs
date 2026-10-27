@@ -1,9 +1,10 @@
 //! Notification-area icon: tooltip status and a menu (arrange devices, private clipboard text,
-//! Connect/Disconnect, the receiver role, Quit), and notifications.
+//! reload config, Connect/Disconnect, the receiver role, Quit), and notifications.
 
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
                                 NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -16,6 +17,8 @@ pub const CMD_KEEP_PRIVATE: u32 = 5;
 /// Switch between controlling devices and being controlled by another PC (restarts the exe).
 pub const CMD_ROLE: u32 = 6;
 pub const CMD_UNPAIR: u32 = 7;
+/// Read wadisplay.ini and devices.ini again.
+pub const CMD_RELOAD: u32 = 8;
 const ROLE: PCWSTR = w!("Be controlled by another PC");
 
 /// The tray picture; values are icon group ids in the exe (build.rs).
@@ -90,6 +93,7 @@ pub fn menu(hwnd: HWND, status: &str, connected: bool, keep_private: bool) -> u3
         let _ = AppendMenuW(m, MF_STRING, CMD_ARRANGE as usize, w!("Arrange devices..."));
         let _ = AppendMenuW(m, MF_STRING | if keep_private { MF_CHECKED } else { MF_UNCHECKED },
                             CMD_KEEP_PRIVATE as usize, w!("Keep private clipboard text on this PC"));
+        let _ = AppendMenuW(m, MF_STRING, CMD_RELOAD as usize, w!("Reload config"));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(m, MF_STRING, CMD_CONNECT as usize, if connected { w!("Disconnect") } else { w!("Connect") });
         let _ = AppendMenuW(m, MF_STRING, CMD_ROLE as usize, ROLE);
@@ -114,8 +118,32 @@ pub fn receiver_menu(hwnd: HWND, status: &str, paired: bool) -> u32 {
     }
 }
 
+/// Whether Settings > Personalization > Colors has apps in dark mode.
+pub fn dark() -> bool {
+    let (mut light, mut size) = (1u32, 4u32);
+    unsafe {
+        let _ = RegGetValueW(HKEY_CURRENT_USER, w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+                             w!("AppsUseLightTheme"), RRF_RT_REG_DWORD, None, Some(&mut light as *mut u32 as _), Some(&mut size));
+    }
+    light == 0
+}
+
+/// Popup menus in the app mode, read on every menu so a change shows on the next one. uxtheme's
+/// SetPreferredAppMode (ordinal 135) and FlushMenuThemes (136) are undocumented, unchanged since
+/// Windows 10 1903; if they are missing menus stay light.
+pub unsafe fn theme_menus() {
+    let dark = dark();
+    let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+    let (Some(set), Some(flush)) = (GetProcAddress(ux, PCSTR(135 as _)), GetProcAddress(ux, PCSTR(136 as _))) else { return };
+    let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set);
+    let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+    set(if dark { 2 } else { 3 }); // ForceDark, ForceLight
+    flush();
+}
+
 /// Shows the menu at the cursor; returns the chosen CMD_* (0 = dismissed).
 unsafe fn track(hwnd: HWND, m: HMENU) -> u32 {
+    theme_menus();
     let mut p = POINT::default();
     let _ = GetCursorPos(&mut p);
     let _ = SetForegroundWindow(hwnd);

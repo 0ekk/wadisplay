@@ -1,22 +1,26 @@
 //! Arrange window (tray menu "Arrange devices..."): the PC's monitors with the devices around them,
 //! like Windows' display arrangement. Dropping a device moves it to the edge and the place along it
-//! facing the drop; devices may share an edge. Double-click renames, right-click disables, enables or
-//! removes, the field at the bottom adds a device by IP address. Offline devices are grey, disabled
-//! ones pale. Lives on the main thread, like `App`.
+//! facing the drop; devices may share an edge. Double-click renames; right-click also opens a
+//! device's adb connection window, disables, enables or removes; hovering shows how it is connected;
+//! the field at the bottom adds a device by IP address, `IP:port`, USB serial or mDNS name. Offline
+//! devices are grey, disabled ones pale. Light or dark as the Windows app mode. Lives on the main
+//! thread, like `App`.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 
-use windows::core::{w, BOOL, HSTRING, PCWSTR};
+use windows::core::{w, BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{EM_LIMITTEXT, EM_SETCUEBANNER, EM_SETSEL};
-use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::Controls::{SetWindowTheme, EM_LIMITTEXT, EM_SETCUEBANNER, EM_SETSEL, TOOLTIPS_CLASSW, TTF_SUBCLASS,
+                                   TTM_ADDTOOLW, TTM_DELTOOLW, TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use wadisplay_pc::devices::{self, Kind};
+use wadisplay_pc::devices::{self, Kind, Via};
 use wadisplay_pc::switch::{self, Rect};
 use wadisplay_proto::Side;
 
@@ -32,6 +36,21 @@ pub struct Item {
     pub pos: u16,
     pub online: bool,
     pub enabled: bool,
+    /// How it is connected (`Device::link`), shown on hover.
+    pub link: String,
+    /// Its adb connection (`Device::connection`), which "Connection..." edits; None for a PC.
+    pub conn: Option<(Via, [String; 3])>,
+}
+
+/// The Connection window of one device: a type list, an editable list of what adb found for that
+/// type, a hint line, OK and Cancel.
+#[derive(Clone, Copy)]
+struct Conn {
+    hwnd: HWND,
+    id: usize,
+    kind: HWND,
+    value: HWND,
+    hint: HWND,
 }
 
 /// A press on a device box: the grab point's offset from the box and the cursor (desktop px), where
@@ -52,12 +71,42 @@ struct State {
     press: Option<Press>,
     /// The name field over a device being renamed, and that device's id.
     rename: Option<(HWND, usize)>,
+    conn: Option<Conn>,
+    /// What adb last found for each `Via`, for the Connection lists.
+    found: [Vec<String>; 3],
     /// The IP address field and the Add button.
     ip: HWND,
     add: HWND,
     font: HFONT,
     /// Shown instead of the help line until the next note or drop.
     note: Option<String>,
+    /// The tooltip window and the tools it has: one per device box, by id, with its rect and text.
+    tip: HWND,
+    tips: Vec<(usize, RECT, String)>,
+    /// The app mode, as last applied.
+    dark: bool,
+}
+
+/// Colours (0xBBGGRR) in the light or dark app mode; online devices are accent blue in both. Pairs
+/// are fill and text.
+struct Colors {
+    bg: u32,
+    text: u32,
+    help: u32,
+    field: u32,
+    monitor: (u32, u32),
+    offline: (u32, u32),
+    disabled: (u32, u32),
+}
+
+fn colors(dark: bool) -> Colors {
+    if dark {
+        Colors { bg: 0x202020, text: 0xFFFFFF, help: 0xA0A0A0, field: 0x2D2D2D, monitor: (0x3C3C3C, 0xD0D0D0),
+                 offline: (0x5A5A5A, 0xD0D0D0), disabled: (0x2E2E2E, 0x7A7A7A) }
+    } else {
+        Colors { bg: 0xFFFFFF, text: 0x000000, help: 0x6D6D6D, field: 0xFFFFFF, monitor: (0xC8C8C8, 0x303030),
+                 offline: (0xB4B4B4, 0x505050), disabled: (0xE6E6E6, 0x8C8C8C) }
+    }
 }
 
 thread_local! {
@@ -67,6 +116,8 @@ thread_local! {
 /// Posted to the window: end the rename, keeping the typed name if wparam is 1.
 const WM_END_RENAME: u32 = WM_APP + 1;
 const ID_ADD: usize = 1;
+/// The Connection window's type list; its OK and Cancel are IDOK and IDCANCEL.
+const ID_KIND: i32 = 10;
 /// The edit fields' own window procedure, which `field` calls on.
 static EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
 
@@ -102,11 +153,17 @@ pub fn open(devices: Vec<Item>) {
                 for c in [ip, add] {
                     SendMessageW(c, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
                 }
-                let cue = w!("Wi-Fi IP address of a device to add, like 192.168.1.20");
+                let cue = w!("Device to add: IP like 192.168.1.20, IP:port, USB serial (adb devices) or name (adb mdns services)");
                 SendMessageW(ip, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize)));
                 field(ip);
-                S.with_borrow_mut(|s| (s.hwnd, s.ip, s.add, s.font) = (Some(h), ip, add, font));
+                let tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, None, WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+                                          CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, Some(h), None, Some(inst), None)
+                    .unwrap_or_default();
+                // A width limit makes it break lines at \r\n.
+                SendMessageW(tip, TTM_SETMAXTIPWIDTH, None, Some(LPARAM(480 * k as isize / 96)));
+                S.with_borrow_mut(|s| (s.hwnd, s.ip, s.add, s.font, s.tip) = (Some(h), ip, add, font, tip));
                 place_fields(h);
+                apply_theme(h);
                 h
             }
         };
@@ -114,6 +171,178 @@ pub fn open(devices: Vec<Item>) {
         let _ = SetForegroundWindow(hwnd);
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
+}
+
+/// Both windows in the app mode; `paint` and the controls' colours (`ctl_color`) follow `State::dark`.
+unsafe fn apply_theme(h: HWND) {
+    let dark = crate::tray::dark();
+    let (add, tip, conn) = S.with_borrow_mut(|s| {
+        s.dark = dark;
+        (s.add, s.tip, s.conn)
+    });
+    theme(h, dark, &[add, tip], &[]);
+    if let Some(c) = conn {
+        theme_conn(c, dark);
+    }
+}
+
+/// The title bar and themed controls of `h`: buttons and tooltips as Explorer, combo boxes as the
+/// file dialog, the dark themes Windows has for them.
+unsafe fn theme(h: HWND, dark: bool, explorer: &[HWND], cfd: &[HWND]) {
+    let on = BOOL::from(dark);
+    let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &on as *const _ as _, size_of::<BOOL>() as u32);
+    for (cs, name) in [(explorer, w!("DarkMode_Explorer")), (cfd, w!("DarkMode_CFD"))] {
+        for c in cs {
+            let _ = SetWindowTheme(*c, if dark { name } else { PCWSTR::null() }, PCWSTR::null());
+        }
+    }
+    let _ = RedrawWindow(Some(h), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+}
+
+unsafe fn theme_conn(c: Conn, dark: bool) {
+    let buttons = [GetDlgItem(Some(c.hwnd), IDOK.0).unwrap_or_default(), GetDlgItem(Some(c.hwnd), IDCANCEL.0).unwrap_or_default()];
+    theme(c.hwnd, dark, &buttons, &[c.kind, c.value]);
+}
+
+/// Text and background of fields, lists, labels and the buttons' corners.
+unsafe fn ctl_color(msg: u32, wp: WPARAM) -> LRESULT {
+    let (k, dc) = (colors(S.with_borrow(|s| s.dark)), HDC(wp.0 as _));
+    let (text, bg) = match msg {
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => (k.text, k.field),
+        WM_CTLCOLORSTATIC => (k.help, k.bg),
+        _ => (k.text, k.bg),
+    };
+    SetTextColor(dc, COLORREF(text));
+    SetBkColor(dc, COLORREF(bg));
+    SetDCBrushColor(dc, COLORREF(bg));
+    LRESULT(GetStockObject(DC_BRUSH).0 as isize)
+}
+
+/// Opens device `id`'s Connection window over the arrange window (one at a time) and asks adb what
+/// it can find.
+unsafe fn open_conn(owner: HWND, id: usize) {
+    if let Some(c) = S.with_borrow(|s| s.conn) {
+        let _ = DestroyWindow(c.hwnd);
+    }
+    let Some((name, via)) = S.with_borrow(|s| {
+        let d = s.devices.iter().find(|d| d.id == id)?;
+        Some((d.name.clone(), d.conn.as_ref()?.0))
+    }) else { return };
+    let inst = GetModuleHandleW(None).unwrap().into();
+    let wc = WNDCLASSW { lpfnWndProc: Some(conn_proc), hInstance: inst, lpszClassName: w!("wadisplay-connection"),
+                         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(), ..Default::default() };
+    RegisterClassW(&wc); // fails harmlessly from the second window on
+    let dpi = GetDpiForWindow(owner);
+    let k = |v: i32| v * dpi as i32 / 96;
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    let mut r = RECT { left: 0, top: 0, right: k(420), bottom: k(132) };
+    let _ = AdjustWindowRectExForDpi(&mut r, style, false, WINDOW_EX_STYLE(0), dpi);
+    let mut o = RECT::default();
+    let _ = GetWindowRect(owner, &mut o);
+    let (w, ht) = (r.right - r.left, r.bottom - r.top);
+    let Ok(h) = CreateWindowExW(WINDOW_EX_STYLE(0), w!("wadisplay-connection"), &HSTRING::from(format!("{name}: adb connection")),
+                                style, (o.left + o.right - w) / 2, (o.top + o.bottom - ht) / 2, w, ht, Some(owner), None,
+                                Some(inst), None) else { return };
+    let font = S.with_borrow(|s| s.font);
+    // A combo box's height includes its open list.
+    let child = |class: PCWSTR, text: PCWSTR, style: i32, id: i32, (x, y, cw, ch): (i32, i32, i32, i32)| {
+        let c = CreateWindowExW(WINDOW_EX_STYLE(0), class, text, WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style as u32), k(x), k(y),
+                                k(cw), k(ch), Some(h), Some(HMENU(id as _)), Some(inst), None).unwrap_or_default();
+        SendMessageW(c, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        c
+    };
+    let (tab, scroll) = (WS_TABSTOP.0 as i32, WS_VSCROLL.0 as i32);
+    let kind = child(w!("COMBOBOX"), PCWSTR::null(), tab | scroll | CBS_DROPDOWNLIST, ID_KIND, (12, 12, 96, 200));
+    let value = child(w!("COMBOBOX"), PCWSTR::null(), tab | scroll | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0, (116, 12, 292, 240));
+    let hint = child(w!("STATIC"), PCWSTR::null(), 0, 0, (12, 48, 396, 36));
+    child(w!("BUTTON"), w!("OK"), tab | BS_DEFPUSHBUTTON, IDOK.0, (232, 94, 84, 26));
+    child(w!("BUTTON"), w!("Cancel"), tab | BS_PUSHBUTTON, IDCANCEL.0, (324, 94, 84, 26));
+    for v in Via::ALL {
+        SendMessageW(kind, CB_ADDSTRING, None, Some(LPARAM(HSTRING::from(v.label()).as_ptr() as isize)));
+    }
+    SendMessageW(kind, CB_SETCURSEL, Some(WPARAM(via as usize)), None);
+    let c = Conn { hwnd: h, id, kind, value, hint };
+    S.with_borrow_mut(|s| s.conn = Some(c));
+    show_via(true);
+    theme_conn(c, S.with_borrow(|s| s.dark));
+    let _ = ShowWindow(h, SW_SHOW);
+    let _ = SetFocus(Some(value));
+    emit(Ev::Discover);
+}
+
+/// The Connection window's value list: what adb found for the chosen type; with `set_text` the
+/// field also takes the device's value for that type (its own, or a guess), else it keeps what is
+/// typed.
+unsafe fn show_via(set_text: bool) {
+    let Some(c) = S.with_borrow(|s| s.conn) else { return };
+    let via = Via::ALL[(SendMessageW(c.kind, CB_GETCURSEL, None, None).0 as usize).min(2)];
+    let Some((items, value)) = S.with_borrow(|s| {
+        let d = s.devices.iter().find(|d| d.id == c.id)?;
+        Some((s.found[via as usize].clone(), d.conn.as_ref()?.1[via as usize].clone()))
+    }) else { return };
+    let text = if set_text { value } else { text_of(c.value) };
+    SendMessageW(c.value, CB_RESETCONTENT, None, None); // empties the field too
+    for i in items {
+        SendMessageW(c.value, CB_ADDSTRING, None, Some(LPARAM(HSTRING::from(i).as_ptr() as isize)));
+    }
+    let _ = SetWindowTextW(c.value, &HSTRING::from(text));
+    let _ = SetWindowTextW(c.hint, &HSTRING::from(via.hint()));
+}
+
+/// What adb found, from `devices::discovered`.
+pub fn found(f: [Vec<String>; 3]) {
+    S.with_borrow_mut(|s| s.found = f);
+    unsafe { show_via(false) };
+}
+
+/// Tab, Enter and Esc for the Connection window; true when it took the message.
+pub fn dialog_message(msg: &MSG) -> bool {
+    S.with_borrow(|s| s.conn.map(|c| c.hwnd)).is_some_and(|h| unsafe { IsDialogMessageW(h, msg).as_bool() })
+}
+
+/// OK: a new connection goes to `App` and the window closes; a bad one is explained in the hint line.
+unsafe fn conn_ok(c: Conn) {
+    let via = Via::ALL[(SendMessageW(c.kind, CB_GETCURSEL, None, None).0 as usize).min(2)];
+    match devices::via_serial(via, &text_of(c.value)) {
+        Err(e) => {
+            let _ = SetWindowTextW(c.hint, &HSTRING::from(e));
+        }
+        Ok(serial) => {
+            // What the window first showed is the current connection: OK on it changes nothing.
+            let current = S.with_borrow(|s| {
+                let (v, values) = s.devices.iter().find(|d| d.id == c.id)?.conn.clone()?;
+                devices::via_serial(v, &values[v as usize]).ok()
+            });
+            if current.as_ref() != Some(&serial) {
+                emit(Ev::Connect(c.id, serial));
+            }
+            let _ = DestroyWindow(c.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn conn_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let Some(c) = S.with_borrow(|s| s.conn).filter(|c| c.hwnd == h) else { return DefWindowProcW(h, msg, wp, lp) };
+    match msg {
+        WM_COMMAND => match (wp.0 & 0xFFFF) as i32 {
+            id if id == IDOK.0 => conn_ok(c),
+            id if id == IDCANCEL.0 => {
+                let _ = DestroyWindow(h);
+            }
+            ID_KIND if (wp.0 >> 16) as u32 == CBN_SELCHANGE => show_via(true),
+            _ => {}
+        },
+        WM_ERASEBKGND => {
+            let mut r = RECT::default();
+            let _ = GetClientRect(h, &mut r);
+            fill(HDC(wp.0 as _), &r, colors(S.with_borrow(|s| s.dark)).bg);
+            return LRESULT(1);
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => return ctl_color(msg, wp),
+        WM_DESTROY => S.with_borrow_mut(|s| s.conn = None),
+        _ => return DefWindowProcW(h, msg, wp, lp),
+    }
+    LRESULT(0)
 }
 
 /// Refreshes the devices while the window is open.
@@ -130,6 +359,9 @@ pub fn update(devices: Vec<Item>) {
             if gone(id) {
                 unsafe { let _ = PostMessageW(Some(h), WM_END_RENAME, WPARAM(0), LPARAM(0)); }
             }
+        }
+        if let Some(c) = s.conn.filter(|c| gone(c.id)) {
+            unsafe { let _ = PostMessageW(Some(c.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)); }
         }
         s.devices = devices;
         s.hwnd
@@ -281,14 +513,13 @@ unsafe extern "system" fn field_proc(e: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 unsafe fn add(h: HWND) {
     let ip = S.with_borrow(|s| s.ip);
     let text = text_of(ip).trim().to_string();
-    note(if text.is_empty() {
-        "Type the device's Wi-Fi IP address first.".into()
-    } else if text.parse::<std::net::Ipv4Addr>().is_err() {
-        format!("\"{text}\" is not an IP address like 192.168.1.20.")
-    } else {
-        emit(Ev::Add(text.clone()));
-        let _ = SetWindowTextW(ip, w!(""));
-        format!("Connecting to {text} over adb...")
+    note(match devices::add_target(&text) {
+        Err(e) => e,
+        Ok(serial) => {
+            emit(Ev::Add(serial));
+            let _ = SetWindowTextW(ip, w!(""));
+            format!("Connecting to {text} over adb...")
+        }
     });
     let _ = InvalidateRect(Some(h), None, false);
 }
@@ -376,7 +607,8 @@ unsafe fn paint(hwnd: HWND) {
     let old_bmp = SelectObject(dc, bmp.into());
     let old_font = SelectObject(dc, S.with_borrow(|s| s.font).into());
     SetBkMode(dc, TRANSPARENT);
-    FillRect(dc, &c, GetSysColorBrush(COLOR_WINDOW));
+    let k = colors(S.with_borrow(|s| s.dark));
+    fill(dc, &c, k.bg);
 
     let mut monitors: Vec<Rect> = vec![];
     let _ = EnumDisplayMonitors(None, None, Some(add_monitor), LPARAM(&mut monitors as *mut _ as isize));
@@ -384,8 +616,8 @@ unsafe fn paint(hwnd: HWND) {
         let r = l.client(m);
         // Inset, so neighbouring monitors stay apart.
         let r = RECT { left: r.left + 2, top: r.top + 2, right: r.right - 2, bottom: r.bottom - 2 };
-        fill(dc, &r, 0xC8C8C8);
-        text(dc, r, 0x303030, "PC", DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        fill(dc, &r, k.monitor.0);
+        text(dc, r, k.monitor.1, "PC", DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     let (empty, note) = S.with_borrow(|s| {
         let pressed = s.press.map(|p| p.id);
@@ -393,10 +625,10 @@ unsafe fn paint(hwnd: HWND) {
         for d in s.devices.iter().filter(|d| Some(d.id) != pressed).chain(s.devices.iter().filter(|d| Some(d.id) == pressed)) {
             let r = l.client(l.device(s, d));
             // Windows accent blue, grey, or pale grey.
-            let (bg, fg, state) = match (d.enabled, d.online) {
-                (false, _) => (0xE6E6E6, 0x8C8C8C, ", disabled"),
-                (_, true) => (0xD77800, 0xFFFFFF, ""),
-                _ => (0xB4B4B4, 0x505050, ", offline"),
+            let ((bg, fg), state) = match (d.enabled, d.online) {
+                (false, _) => (k.disabled, ", disabled"),
+                (_, true) => ((0xD77800, 0xFFFFFF), ""),
+                _ => (k.offline, ", offline"),
             };
             fill(dc, &r, bg);
             let (mid, pad) = ((r.top + r.bottom) / 2, 4);
@@ -411,12 +643,12 @@ unsafe fn paint(hwnd: HWND) {
         "No devices yet. Plug a device with USB debugging on into this PC and it joins by itself, or add one by its Wi-Fi \
          IP address below."
     } else {
-        "Drag a device to where it sits by the PC; several can share an edge. Double-click a device to rename it, right-click \
-         to disable or remove it. Grey ones are offline, pale ones disabled."
+        "Drag a device to where it sits by the PC; several can share an edge. Double-click renames it; right-click changes \
+         its connection, disables or removes it; hovering shows its connection. Grey: offline, pale: disabled."
     };
     let (color, s) = match &note {
-        Some(n) => (GetSysColor(COLOR_WINDOWTEXT), n.as_str()),
-        None => (GetSysColor(COLOR_GRAYTEXT), help),
+        Some(n) => (k.text, n.as_str()),
+        None => (k.help, help),
     };
     text(dc, l.hint, color, s, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
 
@@ -426,6 +658,29 @@ unsafe fn paint(hwnd: HWND) {
     let _ = DeleteObject(bmp.into());
     let _ = DeleteDC(dc);
     let _ = EndPaint(hwnd, &ps);
+    sync_tips(hwnd, &l);
+}
+
+/// One tooltip region per device box, registered again when a box or its text changes; none while a
+/// box is pressed, so no tip pops up mid-drag.
+unsafe fn sync_tips(h: HWND, l: &Layout) {
+    let Some((tip, old, new)) = S.with_borrow_mut(|s| {
+        let new: Vec<(usize, RECT, String)> = match s.press {
+            Some(_) => vec![],
+            None => s.devices.iter().map(|d| (d.id, l.client(l.device(s, d)), d.link.replace('\n', "\r\n"))).collect(),
+        };
+        (new != s.tips).then(|| (s.tip, std::mem::replace(&mut s.tips, new.clone()), new))
+    }) else { return };
+    let info = |id: usize| TTTOOLINFOW { cbSize: size_of::<TTTOOLINFOW>() as u32, uFlags: TTF_SUBCLASS, hwnd: h, uId: id,
+                                         ..Default::default() };
+    for (id, ..) in old {
+        SendMessageW(tip, TTM_DELTOOLW, None, Some(LPARAM(&info(id) as *const _ as isize)));
+    }
+    for (id, rect, text) in new {
+        let mut text: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        let t = TTTOOLINFOW { rect, lpszText: PWSTR(text.as_mut_ptr()), ..info(id) };
+        SendMessageW(tip, TTM_ADDTOOLW, None, Some(LPARAM(&t as *const _ as isize)));
+    }
 }
 
 /// Never holds `S` across a call that sends this window a message (ReleaseCapture, DestroyWindow,
@@ -494,28 +749,39 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_RBUTTONUP => {
             let l = Layout::new(h);
-            let Some((id, name, enabled)) = S.with_borrow(|s| {
+            let Some((id, name, enabled, adb)) = S.with_borrow(|s| {
                 let id = l.hit(s, l.desk_point(lp))?;
                 let d = s.devices.iter().find(|d| d.id == id)?;
-                Some((id, d.name.clone(), d.enabled))
+                Some((id, d.name.clone(), d.enabled, d.conn.is_some()))
             }) else { return LRESULT(0) };
             let Ok(m) = CreatePopupMenu() else { return LRESULT(0) };
             let _ = AppendMenuW(m, MF_STRING, 1, w!("Rename"));
+            if adb {
+                let _ = AppendMenuW(m, MF_STRING, 4, w!("Connection..."));
+            }
             let _ = AppendMenuW(m, MF_STRING, 3, if enabled { w!("Disable") } else { w!("Enable") });
             let _ = AppendMenuW(m, MF_STRING, 2, w!("Remove..."));
             let (x, y) = client_point(lp);
             let mut p = POINT { x, y };
             let _ = ClientToScreen(h, &mut p);
+            crate::tray::theme_menus();
             let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, None, h, None);
             let _ = DestroyMenu(m);
             match cmd.0 {
                 1 => start_rename(h, id),
+                4 => open_conn(h, id),
                 2 => confirm_remove(id, name),
                 3 => emit(Ev::Enable(id, !enabled)),
                 _ => {}
             }
         }
         WM_COMMAND if wp.0 & 0xFFFF == ID_ADD && (wp.0 >> 16) as u32 == BN_CLICKED => add(h),
+        WM_CTLCOLOREDIT | WM_CTLCOLORBTN => return ctl_color(msg, wp),
+        WM_SETTINGCHANGE => {
+            if crate::tray::dark() != S.with_borrow(|s| s.dark) {
+                apply_theme(h);
+            }
+        }
         WM_END_RENAME => end_rename(h, wp.0 == 1),
         WM_CAPTURECHANGED => {
             S.with_borrow_mut(|s| s.press = None);
@@ -524,6 +790,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_DESTROY => {
             let font = S.with_borrow_mut(|s| {
                 (s.hwnd, s.press, s.rename) = (None, None, None);
+                s.tips.clear(); // destroyed with its owner
                 s.font
             });
             let _ = DeleteObject(font.into());

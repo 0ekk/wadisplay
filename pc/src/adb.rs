@@ -40,11 +40,17 @@ impl Request {
     }
 }
 
+/// Where adb reached a device (the address an mDNS lookup found), and the LAN address it reported.
+pub struct Reach {
+    pub at: String,
+    pub lan: Option<String>,
+}
+
 pub enum Event {
     /// The server runs with this key and pid, on a device of this kind and serial number.
-    Launched([u8; 32], u32, Kind, String),
+    Launched([u8; 32], u32, Kind, String, Reach),
     /// Revive found the server still running.
-    Running,
+    Running(Reach),
     Failed(String),
 }
 
@@ -56,7 +62,11 @@ fn fnv(b: &[u8]) -> String {
 struct Adb<'a> {
     /// adb.exe
     path: &'a str,
+    /// `devices::MDNS` until `connect` finds the device's address.
     serial: String,
+    /// Its serial number, which `devices::MDNS` looks up, and its address, if known.
+    id: String,
+    ip: String,
 }
 
 impl Adb<'_> {
@@ -86,18 +96,64 @@ impl Adb<'_> {
     }
 
     /// `name` is for the error. After a reboot adbd only listens on USB: the watcher switches it
-    /// back to Wi-Fi once the device is plugged in.
-    fn connect(&self, name: &str) -> Result<(), String> {
-        let _ = self.run(&["connect", &self.serial]);
+    /// back to Wi-Fi once the device is plugged in. A USB serial is only checked.
+    fn connect(&mut self, name: &str) -> Result<(), String> {
+        let mdns = match self.serial.as_str() {
+            devices::MDNS if self.id.is_empty() => return Err(format!("{name}: no serial number yet to look up in adb mdns services")),
+            devices::MDNS => Some(format!("adb-{}", self.id)),
+            s => s.strip_prefix("mdns:").map(String::from),
+        };
+        if let Some(want) = mdns {
+            return self.connect_mdns(name, &want);
+        }
+        let tcp = self.serial.contains(':');
+        if tcp {
+            let _ = self.run(&["connect", &self.serial]);
+        }
         if self.online() {
             return Ok(());
         }
         if self.run(&["devices"]).unwrap_or_default().contains(&format!("{}\tunauthorized", self.serial)) {
             return Err(format!("{}: allow USB debugging from this PC on the device's screen", self.serial));
         }
+        if !tcp {
+            return Err(format!("{} is not on USB: plug the {name} in", self.serial));
+        }
         let _ = self.run(&["disconnect", &self.serial]);
         Err(format!("cannot reach {} over adb ({name} off Wi-Fi while asleep? After a {name} reboot, plug it in by USB once)",
                     self.serial))
+    }
+
+    /// Tries the addresses `adb mdns services` lists under `want`, connected ones first; the first
+    /// that is online becomes the serial.
+    fn connect_mdns(&mut self, name: &str, want: &str) -> Result<(), String> {
+        let mut addrs = devices::mdns_addresses(&self.run(&["mdns", "services"])?, want);
+        let listed = self.run(&["devices"]).unwrap_or_default();
+        let online: Vec<&str> = devices::adb_devices(&listed).into_iter().filter(|e| e.1 == "device").map(|e| e.0).collect();
+        // adb's list can go empty while the device still answers where it did: those online at its
+        // address too.
+        for s in online.iter().filter(|s| !self.ip.is_empty() && s.rsplit_once(':').is_some_and(|(h, _)| h == self.ip)) {
+            if !addrs.iter().any(|a| a == s) {
+                addrs.push(s.to_string());
+            }
+        }
+        addrs.sort_by_key(|a| !online.contains(&a.as_str()));
+        // ponytail: a stale address on a host that is gone waits for adb connect's timeout; ping
+        // first if lookups get slow.
+        for a in addrs {
+            self.serial = a;
+            if self.online() {
+                return Ok(());
+            }
+            let _ = self.run(&["connect", &self.serial]);
+            if self.online() {
+                return Ok(());
+            }
+            let _ = self.run(&["disconnect", &self.serial]);
+        }
+        self.serial = devices::MDNS.into();
+        Err(format!("adb mdns services lists no address of {want} that answers ({name}: wireless debugging or adb over \
+                     Wi-Fi off? Wireless debugging also needs adb pair once)"))
     }
 
     /// Serial number, LAN address and kind.
@@ -150,15 +206,19 @@ impl Adb<'_> {
         Ok(())
     }
 
-    /// Whether the server with this pid still runs; Err when adb cannot tell.
-    fn running(&self, name: &str, pid: u32) -> Result<bool, String> {
+    /// Whether the server with this pid still runs, and the device's LAN address; Err when adb
+    /// cannot tell.
+    fn running(&mut self, name: &str, pid: u32) -> Result<(bool, Reach), String> {
         self.connect(name)?;
-        Ok(self.shell(&format!("grep -qs wadisplay-server /proc/{pid}/cmdline && echo alive || echo gone"))? == "alive")
+        let out = self.shell(&format!("grep -qs wadisplay-server /proc/{pid}/cmdline && echo alive || echo gone; {}",
+                                      devices::ADDRESSES))?;
+        let (state, addrs) = out.split_once('\n').unwrap_or((&out, ""));
+        Ok((state.trim() == "alive", Reach { at: self.serial.clone(), lan: devices::lan(addrs) }))
     }
 
-    fn launch(&self, cfg: &Config) -> Result<([u8; 32], u32, Kind, String), String> {
+    fn launch(&mut self, cfg: &Config) -> Result<([u8; 32], u32, Kind, String, Reach), String> {
         self.connect(&cfg.dev.name)?;
-        let (id, _, kind) = self.identify()?;
+        let (id, lan, kind) = self.identify()?;
         self.deploy()?;
         let (mut key, mut token) = ([0u8; 32], [0u8; 16]);
         getrandom::fill(&mut key).and_then(|_| getrandom::fill(&mut token)).map_err(|e| e.to_string())?;
@@ -176,25 +236,31 @@ impl Adb<'_> {
             return Err(format!("server did not start: {}", out.trim()));
         };
         log!("{}", out.trim());
-        Ok((key, pid, kind, id))
+        Ok((key, pid, kind, id, Reach { at: self.serial.clone(), lan }))
     }
 }
 
 fn adb(cfg: &Config) -> Adb<'_> {
-    Adb { path: &cfg.adb, serial: format!("{}:5555", cfg.dev.ip) }
+    Adb { path: &cfg.adb, serial: cfg.dev.adb_serial(), id: cfg.dev.id.clone(), ip: cfg.dev.ip.clone() }
 }
 
-/// Connects, deploys and starts the server; returns its key and pid, and the device's kind and
-/// serial number.
-pub fn launch(cfg: &Config) -> Result<([u8; 32], u32, Kind, String), String> {
+/// Connects, deploys and starts the server; returns its key and pid, and the device's kind, serial
+/// number and where adb reached it.
+pub fn launch(cfg: &Config) -> Result<([u8; 32], u32, Kind, String, Reach), String> {
     adb(cfg).launch(cfg)
 }
 
-/// Connects to a device about to be added by its IP; its kind and serial number.
-pub fn probe(path: &str, ip: &str) -> Result<(Kind, String), String> {
-    let a = Adb { path, serial: format!("{ip}:5555") };
+/// `adb devices` and `adb mdns services`, for the arrange window's Connection lists.
+pub fn discover(path: &str) -> (String, String) {
+    let a = Adb { path, serial: String::new(), id: String::new(), ip: String::new() };
+    (a.run(&["devices"]).unwrap_or_default(), a.run(&["mdns", "services"]).unwrap_or_default())
+}
+
+/// Connects to a device about to be added by its adb serial; its kind, serial number and LAN address.
+pub fn probe(path: &str, serial: &str) -> Result<(Kind, String, Option<String>), String> {
+    let mut a = Adb { path, serial: serial.into(), id: String::new(), ip: String::new() };
     a.connect("device")?;
-    a.identify().map(|(id, _, kind)| (kind, id))
+    a.identify().map(|(id, ip, kind)| (kind, id, ip))
 }
 
 pub enum Found {
@@ -203,16 +269,22 @@ pub enum Found {
     Unauthorized(String),
 }
 
-/// For the watcher: switch the device with this serial to adb over Wi-Fi and connect to this IP.
-pub struct Tcpip(pub String, pub String);
+/// For the watcher.
+pub enum Watch {
+    /// Switch the device with this serial to adb over Wi-Fi and connect to this `ip:port`.
+    Tcpip(String, String),
+    /// Report every device again, as if it just appeared: one whose adb serial changed may need a switch.
+    Rescan,
+}
 
 /// Checks `adb devices` every 2 s and reports each device once per appearance (or state change).
-pub fn watch(path: &str, rx: Receiver<Tcpip>, emit: impl Fn(Found)) {
-    let adb = |serial: &str| Adb { path, serial: serial.into() };
+pub fn watch(path: &str, rx: Receiver<Watch>, emit: impl Fn(Found)) {
+    let adb = |serial: &str| Adb { path, serial: serial.into(), id: String::new(), ip: String::new() };
     let mut seen: HashSet<String> = HashSet::new();
     loop {
         let out = adb("").run(&["devices"]).unwrap_or_default();
         let list = devices::adb_devices(&out);
+        let online: Vec<String> = list.iter().filter(|e| e.1 == "device").map(|e| e.0.to_string()).collect();
         seen.retain(|k| list.iter().any(|(s, st)| *k == format!("{s}\t{st}")));
         for &(serial, state) in &list {
             if !seen.insert(format!("{serial}\t{state}")) {
@@ -220,10 +292,7 @@ pub fn watch(path: &str, rx: Receiver<Tcpip>, emit: impl Fn(Found)) {
             }
             match state {
                 "device" => match adb(serial).identify() {
-                    Ok((id, ip, kind)) => {
-                        let wifi = ip.as_ref().is_some_and(|ip| list.contains(&(&format!("{ip}:5555"), "device")));
-                        emit(Found::Seen(Seen { serial: serial.into(), id, ip, kind, wifi }));
-                    }
+                    Ok((id, ip, kind)) => emit(Found::Seen(Seen { serial: serial.into(), id, ip, kind, online: online.clone() })),
                     Err(e) => log!("adb: {serial}: {e}"),
                 },
                 "unauthorized" => emit(Found::Unauthorized(serial.into())),
@@ -231,12 +300,14 @@ pub fn watch(path: &str, rx: Receiver<Tcpip>, emit: impl Fn(Found)) {
             }
         }
         match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Tcpip(serial, ip)) => {
-                log!("adb: {serial}: switching to adb over Wi-Fi ({ip}:5555)");
-                match adb(&serial).run(&["-s", &serial, "tcpip", "5555"]) {
+            Ok(Watch::Rescan) => seen.clear(),
+            Ok(Watch::Tcpip(serial, to)) => {
+                log!("adb: {serial}: switching to adb over Wi-Fi ({to})");
+                let port = to.rsplit_once(':').map_or("5555", |t| t.1);
+                match adb(&serial).run(&["-s", &serial, "tcpip", port]) {
                     Ok(_) => {
                         std::thread::sleep(Duration::from_secs(3));
-                        let _ = adb("").run(&["connect", &format!("{ip}:5555")]);
+                        let _ = adb("").run(&["connect", &to]);
                     }
                     Err(e) => log!("adb: {e}"),
                 }
@@ -256,12 +327,12 @@ pub fn thread(rx: Receiver<Request>, emit: impl Fn(Event)) {
         // A failed check must not replace a server that may still run.
         let running = match req {
             Request::Revive(_, pid) => adb(&cfg).running(&cfg.dev.name, pid),
-            Request::Launch(_) => Ok(false),
+            Request::Launch(_) => Ok((false, Reach { at: String::new(), lan: None })),
         };
         emit(match running {
-            Ok(true) => Event::Running,
-            Ok(false) => match launch(&cfg) {
-                Ok((key, pid, kind, id)) => Event::Launched(key, pid, kind, id),
+            Ok((true, reach)) => Event::Running(reach),
+            Ok((false, _)) => match launch(&cfg) {
+                Ok((key, pid, kind, id, reach)) => Event::Launched(key, pid, kind, id, reach),
                 Err(e) => Event::Failed(e),
             },
             Err(e) => Event::Failed(e),

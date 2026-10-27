@@ -55,23 +55,145 @@ impl Kind {
     }
 }
 
+/// Prints the global IPv4 addresses, which `lan` reads.
+pub const ADDRESSES: &str = "ip -4 -o addr show scope global";
+
 /// Prints what `identity` reads: the serial number, the global IPv4 addresses, then the kind.
 pub const IDENTIFY: &str = "getprop ro.serialno; ip -4 -o addr show scope global; echo --; \
                             getprop ro.build.characteristics; pm has-feature android.software.leanback; wm size; wm density";
 
-/// A device's serial number (adb's USB serial), its LAN address (Wi-Fi or Ethernet, else the first
-/// global one) and its kind, from the output of `IDENTIFY`.
+/// A device's serial number (adb's USB serial), its LAN address (`lan`) and its kind, from the
+/// output of `IDENTIFY`.
 pub fn identity(out: &str) -> (String, Option<String>, Kind) {
     let (head, kind) = out.split_once("\n--").unwrap_or((out, ""));
-    let mut lines = head.lines().map(str::trim);
-    let id = lines.next().unwrap_or("").to_string();
+    let (id, addrs) = head.split_once('\n').unwrap_or((head, ""));
+    (id.trim().to_string(), lan(addrs), Kind::android(kind.trim_start_matches(['\r', '\n'])))
+}
+
+/// The LAN address (Wi-Fi or Ethernet, else the first global one) from the output of `ADDRESSES`.
+pub fn lan(out: &str) -> Option<String> {
     // `ip -o`: "9: wlan0    inet 192.0.2.5/24 brd ... scope global wlan0\ ..."
-    let addrs: Vec<(&str, &str)> = lines.filter_map(|l| {
+    let addrs: Vec<(&str, &str)> = out.lines().filter_map(|l| {
         let w: Vec<&str> = l.split_whitespace().collect();
         (w.len() > 3 && w[2] == "inet").then(|| (w[1], w[3].split('/').next().unwrap_or("")))
     }).collect();
-    let ip = addrs.iter().find(|a| a.0.starts_with("wlan") || a.0.starts_with("eth")).or(addrs.first()).map(|a| a.1.to_string());
-    (id, ip, Kind::android(kind.trim_start_matches(['\r', '\n'])))
+    addrs.iter().find(|a| a.0.starts_with("wlan") || a.0.starts_with("eth")).or(addrs.first()).map(|a| a.1.to_string())
+}
+
+/// `Device::adb` for a device found through `adb mdns services` by its serial number (`id`);
+/// `mdns:<name>` looks up that service name instead (the Add field).
+pub const MDNS: &str = "mdns";
+
+/// The `ip:port` addresses `adb mdns services` lists under `name` (tab-separated name, type,
+/// address): services named `name`, or `name-<suffix>` as wireless debugging names them, repeats
+/// numbered " (2)" and on included, since only one of them may still listen. Wireless debugging
+/// first, then adb over Wi-Fi (`adb tcpip`); pairing services left out.
+pub fn mdns_addresses(out: &str, name: &str) -> Vec<String> {
+    let mut found: Vec<(u8, &str)> = mdns_services(out).into_iter()
+        .filter(|(inst, ..)| *inst == name || inst.strip_prefix(name).is_some_and(|r| r.starts_with('-')))
+        .map(|(_, rank, addr)| (rank, addr)).collect();
+    found.sort_by_key(|f| f.0);
+    let mut out: Vec<String> = vec![];
+    for (_, a) in found {
+        if !out.iter().any(|o| o == a) {
+            out.push(a.into());
+        }
+    }
+    out
+}
+
+/// The connectable services in `adb mdns services` output: name (" (2)" and on cut off), 0 for
+/// wireless debugging or 1 for adb over Wi-Fi, and the IPv4 `ip:port`.
+fn mdns_services(out: &str) -> Vec<(&str, u8, &str)> {
+    out.lines().filter_map(|l| {
+        let mut f = l.trim().split('\t');
+        let (inst, kind, addr) = (f.next()?, f.next()?.trim_end_matches('.'), f.next()?.trim());
+        let rank = match kind {
+            "_adb-tls-connect._tcp" => 0,
+            "_adb._tcp" => 1,
+            _ => return None,
+        };
+        addr.parse::<std::net::SocketAddrV4>().is_ok().then(|| (inst.split(" (").next().unwrap_or(inst), rank, addr))
+    }).collect()
+}
+
+/// The kinds of adb connection the arrange window offers, in its order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    Serial,
+    Tcp,
+    Mdns,
+}
+
+impl Via {
+    pub const ALL: [Via; 3] = [Via::Serial, Via::Tcp, Via::Mdns];
+
+    /// In the type list.
+    pub fn label(self) -> &'static str {
+        match self {
+            Via::Serial => "serial",
+            Via::Tcp => "ip:port",
+            Via::Mdns => "mdns",
+        }
+    }
+
+    /// Under the fields.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Via::Serial => "A USB serial, as adb devices lists it: adb runs over the cable, input and the clipboard over Wi-Fi.",
+            Via::Tcp => "An IP address, with :port unless it is 5555. Plugged in by USB, the device is switched to that port.",
+            Via::Mdns => "A name adb mdns services lists; empty looks it up by its serial number. Follows changing ports.",
+        }
+    }
+}
+
+/// The adb serial for a connection typed into the arrange window: `Tcp` an IPv4 address with an
+/// optional port (5555), `Serial` a USB serial as `adb devices` lists it, `Mdns` a name `adb mdns
+/// services` lists (with or without " (2)" or the service type; empty: by serial number).
+pub fn via_serial(via: Via, text: &str) -> Result<String, String> {
+    let text = text.trim();
+    let ipv4 = |s: &str| s.parse::<std::net::Ipv4Addr>().is_ok();
+    match via {
+        Via::Tcp if ipv4(text) => Ok(format!("{text}:5555")),
+        Via::Tcp => match text.rsplit_once(':') {
+            Some((ip, port)) if ipv4(ip) && port.parse::<u16>().is_ok_and(|p| p > 0) => Ok(text.into()),
+            _ => Err(format!("\"{text}\" is not an IP address like 192.168.1.20, with :port unless it is 5555.")),
+        },
+        Via::Mdns if text.is_empty() || text == MDNS => Ok(MDNS.into()),
+        Via::Mdns if text.starts_with("adb-") && !text.contains(':') => {
+            Ok(format!("{MDNS}:{}", text.split(['.', ' ']).next().unwrap_or(text)))
+        }
+        Via::Mdns => Err(format!("\"{text}\" is not a name adb mdns services lists, like adb-R5CT12AB.")),
+        Via::Serial if text.is_empty() => Err("Type the USB serial adb devices lists.".into()),
+        Via::Serial if text.contains(':') || text.chars().any(|c| c.is_whitespace() || c.is_control()) => {
+            Err(format!("\"{text}\" is not a USB serial: copy it from adb devices."))
+        }
+        Via::Serial => Ok(text.into()),
+    }
+}
+
+/// What the arrange window's Connection lists offer per `Via`, from the output of `adb devices` and
+/// `adb mdns services`: USB serials; `ip:port` connected or advertised; service names.
+pub fn discovered(devices: &str, mdns: &str) -> [Vec<String>; 3] {
+    let mut out: [Vec<String>; 3] = Default::default();
+    let mut add = |via: Via, s: &str| {
+        if !out[via as usize].iter().any(|o| o == s) {
+            out[via as usize].push(s.into());
+        }
+    };
+    for (s, state) in adb_devices(devices) {
+        match s.split_once("._adb") {
+            _ if state != "device" => {}
+            // Connected by adb itself through mDNS: named for its service.
+            Some((name, _)) => add(Via::Mdns, name),
+            None => add(if s.contains(':') { Via::Tcp } else { Via::Serial }, s),
+        }
+    }
+    for (name, _, addr) in mdns_services(mdns) {
+        add(Via::Tcp, addr);
+        add(Via::Mdns, name);
+    }
+    out
 }
 
 /// `adb devices` output as (serial, state); emulators left out.
@@ -88,8 +210,8 @@ pub struct Seen {
     /// Its LAN address, if it has one.
     pub ip: Option<String>,
     pub kind: Kind,
-    /// `ip:5555` is connected too: adb over Wi-Fi works.
-    pub wifi: bool,
+    /// Every serial adb has online: a device whose adb serial is among them needs no switch.
+    pub online: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -105,25 +227,57 @@ pub enum Join {
 }
 
 /// What to do with a device adb just reported. It is a known one if its serial number or LAN
-/// address matches; one on USB, or connected over TCP on a port other than 5555 (wireless
-/// debugging), is switched to adb over Wi-Fi on 5555 unless that already works.
+/// address matches. One whose adb serial is `ip:port` (new ones: port 5555) and not online, such as
+/// one on USB or over wireless debugging, is switched to adb over Wi-Fi on that port; one reached by
+/// its USB serial never is.
 pub fn join(devices: &[Device], ignored: &[String], s: &Seen) -> Join {
-    let tcp = s.serial.rsplit_once(':');
-    let ip = match tcp {
+    let ip = match s.serial.rsplit_once(':') {
         Some((ip, _)) => Some(ip.to_string()),
         None => s.ip.clone(),
     };
-    let tcpip = ip.is_some() && !s.wifi && tcp.is_none_or(|(_, port)| port != "5555");
+    let tcpip = |serial: &str| ip.is_some() && serial.contains(':') && !s.online.iter().any(|o| o == serial);
     let known = devices.iter().position(|d| (!s.id.is_empty() && d.id == s.id) || ip.as_deref() == Some(d.ip.as_str()));
-    match (known, ip) {
+    match (known, ip.clone()) {
         (Some(i), ip) => {
-            let d = &devices[i];
-            Join::Known { i, ip: ip.filter(|ip| *ip != d.ip), id: (d.id != s.id && !s.id.is_empty()).then(|| s.id.clone()), tcpip }
+            let mut d = devices[i].clone();
+            let ip = ip.filter(|ip| *ip != d.ip);
+            if let Some(ip) = &ip {
+                d.set_ip(ip.clone());
+            }
+            Join::Known { i, ip, id: (d.id != s.id && !s.id.is_empty()).then(|| s.id.clone()), tcpip: tcpip(&d.adb_serial()) }
         }
         (None, _) if !s.id.is_empty() && ignored.contains(&s.id) => Join::Ignored,
         (None, None) => Join::NoNetwork,
-        (None, Some(ip)) => Join::Add { ip, tcpip },
+        (None, Some(ip)) => Join::Add { tcpip: tcpip(&format!("{ip}:5555")), ip },
     }
+}
+
+/// The adb serial meant by the arrange window's Add and Connection fields: an IPv4 address (port
+/// 5555), `address:port`, a USB serial as `adb devices` lists it, `mdns`, or a name `adb mdns
+/// services` lists (`adb-...`, copied with or without " (2)" or the service type).
+pub fn add_target(text: &str) -> Result<String, String> {
+    let via = match text {
+        "" => return Err("Type the device's Wi-Fi IP address or USB serial first.".into()),
+        // Dotted digits are a mistyped address, not a serial.
+        _ if text.contains(':') || text.chars().all(|c| c.is_ascii_digit() || c == '.') => Via::Tcp,
+        _ if text == MDNS || text.starts_with("adb-") => Via::Mdns,
+        _ => Via::Serial,
+    };
+    via_serial(via, text)
+}
+
+/// `Device::ip` and `Device::adb` of a device adb reached at `serial`: an `ip:port` serial gives the
+/// address, a USB or mDNS one needs `lan`, the address the device reported.
+pub fn reached(serial: &str, lan: Option<String>) -> Option<(String, String)> {
+    if serial == MDNS || serial.starts_with("mdns:") {
+        return Some((lan?, serial.into()));
+    }
+    let ip = match serial.rsplit_once(':') {
+        Some((ip, _)) => ip.to_string(),
+        None => lan?,
+    };
+    let adb = if serial == format!("{ip}:5555") { String::new() } else { serial.into() };
+    Some((ip, adb))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +287,8 @@ pub struct Device {
     /// Its serial number (`ro.serialno`), once adb has read it; tells the device on USB.
     pub id: String,
     pub ip: String,
+    /// How adb reaches it: empty for `ip:5555`, else `ip:port`, a USB serial or `MDNS` (no Wi-Fi switch).
+    pub adb: String,
     pub side: Side,
     /// Where it sits along its edge: its middle, as a fraction (0..=65535) from the left or top end.
     pub pos: u16,
@@ -140,11 +296,63 @@ pub struct Device {
     pub enabled: bool,
 }
 
+impl Device {
+    /// The serial adb reaches it by.
+    pub fn adb_serial(&self) -> String {
+        if self.adb.is_empty() { format!("{}:5555", self.ip) } else { self.adb.clone() }
+    }
+
+    /// How the PC reaches it, for the arrange window's tooltip; `at` is where adb last reached it,
+    /// which tells the address an mDNS lookup found.
+    pub fn link(&self, at: Option<&str>) -> String {
+        let data = format!("Input and clipboard over Wi-Fi: {}", self.ip);
+        match (self.kind, self.connection()) {
+            (Kind::Pc, _) => format!("Paired PC at {}", self.ip),
+            (_, (Via::Mdns, v)) => {
+                format!("adb over Wi-Fi via mDNS ({}): {}\n{data}", v[2], at.filter(|a| a.contains(':')).unwrap_or("not found yet"))
+            }
+            (_, (Via::Tcp, _)) => format!("adb over Wi-Fi: {}\n{data}", self.adb_serial()),
+            (_, (Via::Serial, _)) => format!("adb over USB: {}\n{data}", self.adb),
+        }
+    }
+
+    /// Its connection for the arrange window: the type, and the value shown for each type, its own
+    /// for its type and else a guess from its address and serial number.
+    pub fn connection(&self) -> (Via, [String; 3]) {
+        let by_id = if self.id.is_empty() { String::new() } else { format!("adb-{}", self.id) };
+        let mut v = [self.id.clone(), format!("{}:5555", self.ip), by_id];
+        let via = match self.adb.as_str() {
+            "" => Via::Tcp,
+            MDNS => Via::Mdns,
+            a => {
+                let via = match a.strip_prefix("mdns:") {
+                    Some(_) => Via::Mdns,
+                    None if a.contains(':') => Via::Tcp,
+                    None => Via::Serial,
+                };
+                v[via as usize] = a.strip_prefix("mdns:").unwrap_or(a).into();
+                via
+            }
+        };
+        (via, v)
+    }
+
+    /// Moves it to a new address; an adb serial at the old one follows.
+    pub fn set_ip(&mut self, ip: String) {
+        if let Some(port) = self.adb.strip_prefix(&format!("{}:", self.ip)) {
+            self.adb = format!("{ip}:{port}");
+        }
+        self.ip = ip;
+    }
+}
+
 pub const HEADER: &str = "\
 # wadisplay devices, written by wadisplay.exe: the arrange window adds, moves, renames and removes them.
-# Quit wadisplay before editing this file. kind: tablet, phone, tv or pc; id: serial number; side:
+# wadisplay rewrites this file on every change: quit it before editing, or save and pick Reload config in
+# the tray menu right away. Save it as UTF-8. kind: tablet, phone, tv or pc; id: serial number; side:
 # left, right, top or bottom; pos: where along that edge, in percent from its left or top end;
-# enabled: no keeps it here unused.
+# enabled: no keeps it here unused; adb: empty for ip:5555, else ip:port, a USB serial, or mdns (found by
+# its serial number in adb mdns services).
 # [ignored]: serial numbers of removed devices, which do not join again by themselves.
 ";
 
@@ -169,7 +377,7 @@ pub fn parse(text: &str) -> (Vec<Device>, Vec<String>) {
             in_ignored = line == "[ignored]";
             if line == "[device]" {
                 cur = Some(Device { name: String::new(), kind: Kind::Tablet, id: String::new(), ip: String::new(),
-                                    side: Side::Right, pos: 32768, enabled: true });
+                                    adb: String::new(), side: Side::Right, pos: 32768, enabled: true });
             }
             continue;
         }
@@ -187,6 +395,7 @@ pub fn parse(text: &str) -> (Vec<Device>, Vec<String>) {
             "kind" => d.kind = Kind::parse(v).unwrap_or(d.kind),
             "id" => d.id = v.into(),
             "ip" => d.ip = v.into(),
+            "adb" => d.adb = v.into(),
             "side" => d.side = Side::parse(v).unwrap_or(d.side),
             "pos" => d.pos = v.parse::<u32>().map_or(d.pos, |p| (p.min(100) * 65535 / 100) as u16),
             "enabled" => d.enabled = v != "no",
@@ -207,8 +416,8 @@ pub fn parse(text: &str) -> (Vec<Device>, Vec<String>) {
 pub fn format(devices: &[Device], ignored: &[String]) -> String {
     let mut s = HEADER.to_string();
     for d in devices {
-        s += &format!("\n[device]\nname={}\nkind={}\nid={}\nip={}\nside={}\npos={}\nenabled={}\n", d.name, d.kind.key(), d.id,
-                      d.ip, d.side.name(), percent(d.pos), if d.enabled { "yes" } else { "no" });
+        s += &format!("\n[device]\nname={}\nkind={}\nid={}\nip={}\nadb={}\nside={}\npos={}\nenabled={}\n", d.name, d.kind.key(),
+                      d.id, d.ip, d.adb, d.side.name(), percent(d.pos), if d.enabled { "yes" } else { "no" });
     }
     if !ignored.is_empty() {
         s += "\n[ignored]\n";
@@ -295,11 +504,15 @@ mod tests {
     }
 
     fn dev(id: &str, ip: &str) -> Device {
-        Device { name: ip.into(), kind: Kind::Tablet, id: id.into(), ip: ip.into(), side: Side::Left, pos: 0, enabled: true }
+        Device { name: ip.into(), kind: Kind::Tablet, id: id.into(), ip: ip.into(), adb: String::new(), side: Side::Left, pos: 0,
+                 enabled: true }
     }
 
+    /// `wifi`: its `ip:5555` is online too.
     fn seen(serial: &str, id: &str, ip: Option<&str>, wifi: bool) -> Seen {
-        Seen { serial: serial.into(), id: id.into(), ip: ip.map(Into::into), kind: Kind::Phone, wifi }
+        let mut online = vec![serial.to_string()];
+        online.extend(ip.filter(|_| wifi).map(|ip| format!("{ip}:5555")));
+        Seen { serial: serial.into(), id: id.into(), ip: ip.map(Into::into), kind: Kind::Phone, online }
     }
 
     #[test]
@@ -333,15 +546,117 @@ mod tests {
         assert_eq!(j(seen("N", "N", None, false)), Join::NoNetwork);
         assert_eq!(join(&[dev("", "192.0.2.1")], &[], &seen("X", "", Some("192.0.2.3"), false)),
                    Join::Add { ip: "192.0.2.3".into(), tcpip: true });
+        // Another port: switched to it unless it is online; a USB serial never is.
+        let mut list = [dev("A", "192.0.2.1"), dev("B", "192.0.2.2")];
+        (list[0].adb, list[1].adb) = ("192.0.2.1:5556".into(), "B".into());
+        let j = |s: Seen| join(&list, &[], &s);
+        assert_eq!(j(seen("A", "A", Some("192.0.2.1"), true)), Join::Known { i: 0, ip: None, id: None, tcpip: true });
+        assert_eq!(j(seen("192.0.2.1:5556", "A", Some("192.0.2.1"), false)), Join::Known { i: 0, ip: None, id: None, tcpip: false });
+        assert_eq!(j(seen("B", "B", Some("192.0.2.2"), false)), Join::Known { i: 1, ip: None, id: None, tcpip: false });
+        let mut moved = seen("A", "A", Some("192.0.2.9"), false);
+        moved.online.push("192.0.2.9:5556".into());
+        assert_eq!(j(moved), Join::Known { i: 0, ip: Some("192.0.2.9".into()), id: None, tcpip: false }, "port follows the move");
+    }
+
+    #[test]
+    fn adb_serials() {
+        let mut d = dev("A", "192.0.2.1");
+        assert_eq!(d.adb_serial(), "192.0.2.1:5555");
+        d.set_ip("192.0.2.2".into());
+        assert_eq!((d.adb_serial(), d.adb.as_str()), ("192.0.2.2:5555".into(), ""));
+        d.adb = "192.0.2.2:5556".into();
+        d.set_ip("192.0.2.3".into());
+        assert_eq!(d.adb, "192.0.2.3:5556");
+        d.adb = "SER1".into();
+        d.set_ip("192.0.2.4".into());
+        assert_eq!(d.adb_serial(), "SER1");
+        assert_eq!(d.link(None), "adb over USB: SER1\nInput and clipboard over Wi-Fi: 192.0.2.4");
+        d.adb.clear();
+        assert_eq!(d.link(None), "adb over Wi-Fi: 192.0.2.4:5555\nInput and clipboard over Wi-Fi: 192.0.2.4");
+        d.kind = Kind::Pc;
+        assert_eq!(d.link(None), "Paired PC at 192.0.2.4");
+
+        assert_eq!(add_target("192.0.2.5"), Ok("192.0.2.5:5555".into()));
+        assert_eq!(add_target("192.0.2.5:41235"), Ok("192.0.2.5:41235".into()));
+        assert_eq!(add_target("R5CT12AB"), Ok("R5CT12AB".into()));
+        for bad in ["", "192.0.2", "192.0.2.5:0", "192.0.2.5:x", "host:5555", "a b"] {
+            assert!(add_target(bad).is_err(), "{bad}");
+        }
+        assert_eq!(reached("192.0.2.5:5555", None), Some(("192.0.2.5".into(), String::new())));
+        assert_eq!(reached("192.0.2.5:5556", Some("192.0.2.6".into())), Some(("192.0.2.5".into(), "192.0.2.5:5556".into())));
+        assert_eq!(reached("SER1", Some("192.0.2.6".into())), Some(("192.0.2.6".into(), "SER1".into())));
+        assert_eq!(reached("SER1", None), None, "USB without a LAN address");
+    }
+
+    #[test]
+    fn connection_fields() {
+        let mut d = dev("SER1", "192.0.2.7");
+        let guesses = ["SER1".to_string(), "192.0.2.7:5555".into(), "adb-SER1".into()];
+        assert_eq!(d.connection(), (Via::Tcp, guesses.clone()));
+        for (adb, via, i) in [("192.0.2.7:5556", Via::Tcp, 1), ("USB9", Via::Serial, 0), ("mdns:adb-SER1-x", Via::Mdns, 2)] {
+            d.adb = adb.into();
+            let (v, values) = d.connection();
+            assert_eq!((v, values[i].as_str()), (via, adb.trim_start_matches("mdns:")), "{adb}");
+        }
+        d.adb = MDNS.into();
+        assert_eq!(d.connection(), (Via::Mdns, guesses));
+
+        assert_eq!(via_serial(Via::Tcp, " 192.0.2.7 "), Ok("192.0.2.7:5555".into()), "port 5555 by default");
+        assert_eq!(via_serial(Via::Tcp, "192.0.2.7:5556"), Ok("192.0.2.7:5556".into()));
+        assert!(via_serial(Via::Tcp, "SER1").is_err());
+        assert_eq!(via_serial(Via::Serial, "SER1"), Ok("SER1".into()));
+        assert!(via_serial(Via::Serial, "192.0.2.7:5555").is_err());
+        assert_eq!(via_serial(Via::Mdns, ""), Ok("mdns".into()));
+        assert_eq!(via_serial(Via::Mdns, "adb-SER1-x (3)"), Ok("mdns:adb-SER1-x".into()));
+        assert!(via_serial(Via::Mdns, "SER1").is_err());
+
+        let devices = "List of devices attached\r\nSER1\tdevice\r\n192.0.2.7:36743\tdevice\r\nSER2\tunauthorized\r\n\
+                       adb-SER3-y._adb-tls-connect._tcp\tdevice\r\n";
+        let mdns = "List of discovered mdns services\r\nadb-SER1\t_adb._tcp\t192.0.2.7:5555\r\n\
+                    adb-SER1-x (2)\t_adb-tls-connect._tcp\t192.0.2.7:36743\r\n";
+        assert_eq!(discovered(devices, mdns), [vec!["SER1".to_string()],
+                                               vec!["192.0.2.7:36743".into(), "192.0.2.7:5555".into()],
+                                               vec!["adb-SER3-y".into(), "adb-SER1".into(), "adb-SER1-x".into()]]);
+    }
+
+    #[test]
+    fn mdns() {
+        // The shape adb 37 printed for the tablet: adb over Wi-Fi, and wireless debugging three times.
+        let out = "List of discovered mdns services\r\nadb-SER1\t_adb._tcp\t192.0.2.7:5555\r\n\
+                   adb-SER1-AbC123 (2)\t_adb-tls-connect._tcp\t192.0.2.7:39947\r\n\
+                   adb-SER1-AbC123\t_adb-tls-connect._tcp.\t192.0.2.7:45663\r\n\
+                   adb-SER1-AbC123\t_adb-tls-pairing._tcp\t192.0.2.7:41235\r\n\
+                   adb-SER12\t_adb._tcp\t192.0.2.8:5555\r\nadb-SER1-x\t_adb._tcp\t[fe80::1]:5555\r\n";
+        assert_eq!(mdns_addresses(out, "adb-SER1"), ["192.0.2.7:39947", "192.0.2.7:45663", "192.0.2.7:5555"]);
+        assert_eq!(mdns_addresses(out, "adb-SER1-AbC123"), ["192.0.2.7:39947", "192.0.2.7:45663"]);
+        assert_eq!(mdns_addresses(out, "adb-SER"), Vec::<String>::new(), "another serial number's prefix");
+        assert_eq!(mdns_addresses("List of discovered mdns services\n", "adb-SER1"), Vec::<String>::new());
+
+        assert_eq!(add_target("mdns"), Ok("mdns".into()));
+        for name in ["adb-SER1-AbC123", "adb-SER1-AbC123 (2)", "adb-SER1-AbC123._adb-tls-connect._tcp"] {
+            assert_eq!(add_target(name), Ok("mdns:adb-SER1-AbC123".into()), "{name}");
+        }
+        assert_eq!(reached("mdns:adb-SER1-AbC123", Some("192.0.2.7".into())),
+                   Some(("192.0.2.7".into(), "mdns:adb-SER1-AbC123".into())));
+        assert_eq!(reached("mdns", None), None);
+
+        let mut d = dev("SER1", "192.0.2.7");
+        d.adb = MDNS.into();
+        assert_eq!(d.link(Some("192.0.2.7:39947")),
+                   "adb over Wi-Fi via mDNS (adb-SER1): 192.0.2.7:39947\nInput and clipboard over Wi-Fi: 192.0.2.7");
+        assert!(d.link(Some("mdns")).starts_with("adb over Wi-Fi via mDNS (adb-SER1): not found yet\n"));
+        // Never switched to adb tcpip, on USB or not.
+        assert_eq!(join(&[d], &[], &seen("SER1", "SER1", Some("192.0.2.7"), false)),
+                   Join::Known { i: 0, ip: None, id: None, tcpip: false });
     }
 
     #[test]
     fn ini_round_trip() {
         let d = vec![
-            Device { name: "客厅电视".into(), kind: Kind::Tv, id: "SER7".into(), ip: "192.0.2.7".into(), side: Side::Right,
-                     pos: 65535, enabled: false },
-            Device { name: "Tablet".into(), kind: Kind::Tablet, id: String::new(), ip: "192.0.2.8".into(), side: Side::Left,
-                     pos: 32768, enabled: true },
+            Device { name: "客厅电视".into(), kind: Kind::Tv, id: "SER7".into(), ip: "192.0.2.7".into(), adb: "SER7".into(),
+                     side: Side::Right, pos: 65535, enabled: false },
+            Device { name: "Tablet".into(), kind: Kind::Tablet, id: String::new(), ip: "192.0.2.8".into(), adb: String::new(),
+                     side: Side::Left, pos: 32768, enabled: true },
         ];
         let ignored = vec!["SER9".to_string()];
         let text = format(&d, &ignored);

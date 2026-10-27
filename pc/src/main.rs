@@ -21,12 +21,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use wadisplay_proto::{self as proto, hex, unhex, Msg, PcState, Side, TabState};
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThread, ProcessPowerThrottling,
-                                        SetProcessInformation, SetThreadPriority, PROCESS_POWER_THROTTLING_STATE,
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThread, OpenProcess, ProcessPowerThrottling,
+                                        QueryFullProcessImageNameW, SetProcessInformation, SetThreadPriority,
+                                        PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
                                         THREAD_PRIORITY_HIGHEST};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -59,7 +60,8 @@ struct Settings {
 }
 
 const DEFAULT_INI: &str = "\
-# wadisplay settings; restart wadisplay.exe after editing. The devices are in devices.ini (tray menu: Arrange devices).
+# wadisplay settings; after editing, tray menu > Reload config (or restart wadisplay.exe). The devices are in devices.ini
+# (tray menu: Arrange devices).
 # adb.exe path, or adb to find it on PATH
 adb=adb
 # raw mouse counts to push past the edge before control crosses over
@@ -80,8 +82,9 @@ impl Settings {
         data_dir().join("wadisplay.ini")
     }
 
-    /// The settings, the devices and the ignored serial numbers.
-    fn load() -> (Settings, Vec<Device>, Vec<String>) {
+    /// The settings, and the devices and the ignored serial numbers, or why devices.ini cannot be
+    /// read (it is then left as it is).
+    fn load() -> (Settings, Result<(Vec<Device>, Vec<String>), String>) {
         let path = Settings::path();
         let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
             let _ = std::fs::write(&path, DEFAULT_INI);
@@ -112,17 +115,23 @@ impl Settings {
              c.remote_step, c.adb, if c.share_private { "share" } else { "keep" }, if c.receive { "receive" } else { "control" });
         let (devices, ignored) = match std::fs::read_to_string(devices_path()) {
             Ok(t) => devices::parse(&t),
+            // Not UTF-8 (saved as GBK, say) or locked: overwriting it would lose the devices.
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                let e = format!("{}: {e}", devices_path().display());
+                log!("{e}");
+                return (c, Err(e));
+            }
             Err(_) => {
                 // The tablet and TV of tablet_ip/side and tv_ip/tv_side, as they were.
                 let side = |v: &str, d| Side::parse(v).unwrap_or(d);
                 let mut v = vec![];
                 if !old[0].is_empty() {
                     v.push(Device { name: "Tablet".into(), kind: Kind::Tablet, id: String::new(), ip: old[0].clone(),
-                                    side: side(&old[1], Side::Left), pos: 32768, enabled: true });
+                                    adb: String::new(), side: side(&old[1], Side::Left), pos: 32768, enabled: true });
                 }
                 if !old[2].is_empty() {
                     v.push(Device { name: "TV".into(), kind: Kind::Tv, id: String::new(), ip: old[2].clone(),
-                                    side: side(&old[3], Side::Right), pos: 32768, enabled: true });
+                                    adb: String::new(), side: side(&old[3], Side::Right), pos: 32768, enabled: true });
                 }
                 save_devices(&v, &[]);
                 (v, vec![])
@@ -139,7 +148,7 @@ impl Settings {
         for d in &devices {
             log!("{} ({}) {} on the {} at {:.0}%", d.name, d.kind.label(), d.ip, d.side.name(), d.pos as f32 / 655.35);
         }
-        (c, devices, ignored)
+        (c, Ok((devices, ignored)))
     }
 
     /// Rewrites one `key=` line in place.
@@ -237,7 +246,7 @@ fn link_sockets() -> Vec<UdpSocket> {
 enum Ev {
     /// Raw Input mouse: relative counts, or absolute 0..65535 coordinates.
     Mouse(i32, i32, bool),
-    RawKey,
+    RawKey(u16),
     Key(u8, bool),
     Button(u8, bool),
     Wheel(bool, i32),
@@ -252,9 +261,15 @@ enum Ev {
     Rename(usize, String),
     Enable(usize, bool),
     Remove(usize),
-    /// Add the device at this IP address, once adb reaches it (`Probed`).
+    /// Add the device at this adb serial (`ip:port` or USB), once adb reaches it (`Probed`).
     Add(String),
-    Probed(String, Result<(Kind, String), String>),
+    /// Its kind, serial number and LAN address.
+    Probed(String, Result<(Kind, String, Option<String>), String>),
+    /// Reach the device by this adb serial from now on (`ip:port`, USB or mDNS).
+    Connect(usize, String),
+    /// Fill the Connection window's lists: `adb devices` and `adb mdns services`, read off the main thread.
+    Discover,
+    Discovered(String, String),
     /// The adb watcher saw a device appear.
     Found(adb::Found),
     Net(usize, Vec<u8>),
@@ -288,7 +303,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_INPUT => {
             match capture::read_raw(lp) {
                 Some(Raw::Mouse { x, y, absolute }) => emit(Ev::Mouse(x, y, absolute)),
-                Some(Raw::Key) => emit(Ev::RawKey),
+                Some(Raw::Key(vk)) => emit(Ev::RawKey(vk)),
                 None => {}
             }
             return DefWindowProcW(h, msg, wp, lp);
@@ -344,6 +359,8 @@ struct Peer {
     /// (rtt us, apply us) of recent replies.
     samples: VecDeque<(u32, u32)>,
     adb_status: String,
+    /// Where adb last reached it: the address an mDNS lookup found, for the arrange window.
+    adb_at: Option<String>,
     /// Remote mode: mouse input becomes D-pad keys while this device has control.
     remote: bool,
 }
@@ -399,8 +416,11 @@ struct App {
     /// Serial numbers of removed devices: they do not join by themselves.
     ignored: Vec<String>,
     /// The adb watcher, and when it last switched each serial to adb over Wi-Fi.
-    watch: Sender<adb::Tcpip>,
+    watch: Sender<adb::Watch>,
     tcpip_at: HashMap<String, Instant>,
+    /// Adds whose probe runs: devices the watcher reports meanwhile do not join by themselves (one
+    /// being added over wireless debugging would be switched to adb tcpip); a rescan follows.
+    probing: usize,
     /// This PC's id and the receiver PCs it paired with (paired.ini).
     me: Id,
     paired: Vec<Paired>,
@@ -422,6 +442,8 @@ struct App {
     abs_prev: Option<(i32, i32)>,
     /// Raw Input key events minus keyboard hook calls; positive for 50 ms = hooks lost.
     key_balance: i64,
+    /// Virtual-key code of the last Raw Input key event, for the "hooks lost" line.
+    raw_vk: u16,
     hook_seen: u64,
     balance_since: Option<Instant>,
     share_private: bool,
@@ -507,7 +529,7 @@ impl App {
                     }
                 }
             }
-            Ev::RawKey => self.key_balance += 1,
+            Ev::RawKey(vk) => (self.key_balance, self.raw_vk) = (self.key_balance + 1, vk),
             Ev::Key(u, down) => {
                 set_bit(&mut self.st.keys, u, down);
                 self.touch();
@@ -613,9 +635,10 @@ impl App {
                 self.save_devices();
                 self.tip_at = now;
             }
-            Ev::Add(ip) => match self.peers.iter().find(|p| p.cfg.dev.ip == ip) {
-                Some(p) => arrange::note(format!("{ip} is already here, as {}.", p.cfg.dev.name)),
-                None => if let Some((&id, b)) = self.beacons.iter().find(|(_, b)| b.from.ip().to_string() == ip) {
+            Ev::Add(serial) => match self.peers.iter().find(|p| p.cfg.dev.adb_serial() == serial) {
+                Some(p) => arrange::note(format!("{serial} is already here, as {}.", p.cfg.dev.name)),
+                None => if let Some((&id, b)) = self.beacons.iter().find(|(_, b)| format!("{}:5555", b.from.ip()) == serial) {
+                    let ip = b.from.ip();
                     // A receiver PC: its next beacon pairs (or joins) it, removed or declined before or not.
                     log!("arrange: adding {} ({ip})", b.name);
                     arrange::note(format!("{} ({ip}) is a PC: it joins once both PCs confirm the pairing code.", b.name));
@@ -623,26 +646,67 @@ impl App {
                     self.declined.retain(|d| *d != id);
                     self.save_devices();
                 } else {
-                    log!("arrange: adding {ip}");
+                    log!("arrange: adding {serial}");
+                    self.probing += 1;
                     let adb = self.settings.adb.clone();
                     std::thread::spawn(move || {
-                        let r = adb::probe(&adb, &ip);
-                        emit_wake(Ev::Probed(ip, r));
+                        let r = adb::probe(&adb, &serial);
+                        emit_wake(Ev::Probed(serial, r));
                     });
                 }
             },
-            Ev::Probed(ip, Err(e)) => {
-                log!("arrange: {ip}: {e}");
+            Ev::Probed(serial, Err(e)) => {
+                self.probed();
+                log!("arrange: {serial}: {e}");
                 arrange::note(e);
             }
-            Ev::Probed(ip, Ok((kind, id))) => {
-                if self.peers.iter().any(|p| p.cfg.dev.ip == ip || (!id.is_empty() && p.cfg.dev.id == id)) {
+            Ev::Probed(serial, Ok((kind, id, lan))) => {
+                self.probed();
+                let Some((ip, adb)) = devices::reached(&serial, lan) else {
+                    return arrange::note(format!("{serial} has no Wi-Fi connection: connect it to Wi-Fi first."));
+                };
+                // A known device: it is reached this way from now on.
+                if let Some(i) = self.peers.iter().position(|p| p.cfg.dev.ip == ip || (!id.is_empty() && p.cfg.dev.id == id)) {
+                    let d = &mut self.peers[i].cfg.dev;
+                    if d.adb_serial() != serial {
+                        log!("arrange: {} now uses adb at {serial}", d.name);
+                        arrange::note(format!("{} now uses adb at {serial}.", d.name));
+                        d.adb = adb;
+                        if d.ip == ip { self.save_devices() } else { self.move_peer(i, ip, now) }
+                    }
                     return;
                 }
                 self.ignored.retain(|i| *i != id); // added by hand: it may join by itself again
-                let d = self.join_new(kind, id, ip, "", now);
+                let d = self.join_new(kind, id, ip, adb, "", now);
                 arrange::note(format!("Added {} on the {} edge. Drag it to where it sits.", d.name, d.side.name()));
             }
+            Ev::Connect(id, serial) => {
+                let Some(i) = self.index(id) else { return };
+                self.peers[i].adb_at = None;
+                let d = &mut self.peers[i].cfg.dev;
+                // A USB serial keeps the address; `ip:port` sets it.
+                let Some((ip, adb)) = devices::reached(&serial, Some(d.ip.clone())) else { return };
+                log!("arrange: {} now uses adb at {serial}", d.name);
+                arrange::note(format!("{} now uses adb at {serial}; its server restarts.", d.name));
+                d.adb = adb;
+                if d.ip == ip {
+                    self.save_devices();
+                    self.restart(i);
+                } else {
+                    self.move_peer(i, ip, now);
+                }
+                // A device on USB now is switched to the new port at once.
+                let _ = self.watch.send(adb::Watch::Rescan);
+                self.tip_at = now;
+            }
+            Ev::Discover => {
+                let adb = self.settings.adb.clone();
+                std::thread::spawn(move || {
+                    let (devices, mdns) = adb::discover(&adb);
+                    emit_wake(Ev::Discovered(devices, mdns));
+                });
+            }
+            Ev::Discovered(d, m) => arrange::found(devices::discovered(&d, &m)),
             Ev::Found(f) => self.on_found(f, now),
             Ev::Net(id, buf) => {
                 if let Some(i) = self.index(id) {
@@ -744,7 +808,7 @@ impl App {
             Some(i) if self.peers[i].cfg.dev.ip != ip && !self.peers[i].answering(now) => self.move_peer(i, ip, now),
             Some(_) => {}
             None => {
-                let d = self.join_new(Kind::Pc, hid, ip, &name, now);
+                let d = self.join_new(Kind::Pc, hid, ip, String::new(), &name, now);
                 self.notify_joined(&d);
             }
         }
@@ -782,7 +846,7 @@ impl App {
         self.paired.push(Paired { id: p.id, name: p.name.clone(), key: p.key });
         receiver::save_paired(&self.me, &self.paired);
         if !self.peers.iter().any(|q| q.cfg.dev.id == hex(&p.id)) {
-            let d = self.join_new(Kind::Pc, hex(&p.id), p.to.ip().to_string(), &p.name, now);
+            let d = self.join_new(Kind::Pc, hex(&p.id), p.to.ip().to_string(), String::new(), &p.name, now);
             self.notify_joined(&d);
         }
     }
@@ -838,7 +902,7 @@ impl App {
     fn move_peer(&mut self, i: usize, ip: String, now: Instant) {
         let mut d = self.peers[i].cfg.dev.clone();
         log!("{} moved from {} to {ip}", d.name, d.ip);
-        d.ip = ip;
+        d.set_ip(ip);
         self.bye(i);
         self.peers.remove(i);
         self.add_peer(d, now);
@@ -857,8 +921,17 @@ impl App {
             }
             return;
         }
+        if let adb::Event::Launched(.., r) | adb::Event::Running(r) = &e {
+            // Reached by USB serial or mDNS, it talks to the address it reports: one DHCP changed
+            // gets a new peer there, whose server starts on the next tick.
+            let d = &self.peers[i].cfg.dev;
+            if let Some(ip) = r.lan.as_ref().filter(|ip| **ip != d.ip && !d.adb_serial().contains(':')) {
+                return self.move_peer(i, ip.clone(), now);
+            }
+            self.peers[i].adb_at = Some(r.at.clone());
+        }
         match e {
-            adb::Event::Launched(key, pid, kind, id) => {
+            adb::Event::Launched(key, pid, kind, id, _) => {
                 let p = &mut self.peers[i];
                 (p.key, p.rx_seq, p.dirty, p.server_pid) = (Some(key), 0, true, Some(pid));
                 let _ = p.clip.send(clip::Cmd::Key(key));
@@ -872,7 +945,7 @@ impl App {
                     self.save_devices();
                 }
             }
-            adb::Event::Running => {
+            adb::Event::Running(_) => {
                 let p = &mut self.peers[i];
                 let s = format!("{0} server running but not answering ({0} asleep?)", p.cfg.dev.name);
                 // The check takes a moment: the server may have answered meanwhile.
@@ -965,7 +1038,8 @@ impl App {
             self.balance_since = None;
         } else if now - *self.balance_since.get_or_insert(now) > Duration::from_millis(50) {
             if self.key_balance > 0 {
-                log!("keyboard hook missed {} key events: reinstalling hooks", self.key_balance);
+                log!("keyboard hook missed {} key events (last vk 0x{:02X}, foreground {}): reinstalling hooks",
+                     self.key_balance, self.raw_vk, foreground_exe());
                 capture::rehook();
                 self.release_all("hooks lost");
             }
@@ -1062,7 +1136,8 @@ impl App {
         self.peers.iter().map(|p| {
             let d = &p.cfg.dev;
             arrange::Item { id: p.id, name: d.name.clone(), kind: d.kind, side: d.side, pos: d.pos, online: online(p),
-                            enabled: d.enabled }
+                            enabled: d.enabled, link: d.link(p.adb_at.as_deref()),
+                            conn: (d.kind != Kind::Pc).then(|| d.connection()) }
         }).collect()
     }
 
@@ -1072,26 +1147,32 @@ impl App {
 
     /// Adds a device under `name`, or its kind's default name if that is empty or taken, on the edge
     /// with fewest devices; saved.
-    fn join_new(&mut self, kind: Kind, id: String, ip: String, name: &str, now: Instant) -> Device {
+    fn join_new(&mut self, kind: Kind, id: String, ip: String, adb: String, name: &str, now: Instant) -> Device {
         let names = || self.peers.iter().map(|p| p.cfg.dev.name.as_str());
         let name = devices::check_name(name, names()).unwrap_or_else(|_| devices::default_name(kind, names()));
         let (side, pos) = devices::place(&self.peers.iter().map(|p| (p.cfg.dev.side, p.cfg.dev.pos)).collect::<Vec<_>>());
         log!("added {name} ({}) {ip} on the {}", kind.label(), side.name());
-        let d = Device { name, kind, id, ip, side, pos, enabled: true };
+        let d = Device { name, kind, id, ip, adb, side, pos, enabled: true };
         self.add_peer(d.clone(), now);
         self.save_devices();
         self.tip_at = now;
         d
     }
 
-    /// Switches a device to adb over Wi-Fi, at most every 20 s per serial: its adbd restarts and it
-    /// shows up again meanwhile.
-    fn tcpip(&mut self, serial: &str, ip: &str, now: Instant) {
+    /// An Add's probe finished: the watcher reports every device again, now that it may be known.
+    fn probed(&mut self) {
+        self.probing = self.probing.saturating_sub(1);
+        let _ = self.watch.send(adb::Watch::Rescan);
+    }
+
+    /// Switches a device to adb over Wi-Fi at `to` (`ip:port`), at most every 20 s per serial: its
+    /// adbd restarts and it shows up again meanwhile.
+    fn tcpip(&mut self, serial: &str, to: String, now: Instant) {
         if self.tcpip_at.get(serial).is_some_and(|t| now - *t < Duration::from_secs(20)) {
             return;
         }
         self.tcpip_at.insert(serial.into(), now);
-        let _ = self.watch.send(adb::Tcpip(serial.into(), ip.into()));
+        let _ = self.watch.send(adb::Watch::Tcpip(serial.into(), to));
     }
 
     fn on_found(&mut self, f: adb::Found, now: Instant) {
@@ -1114,8 +1195,8 @@ impl App {
                     self.move_peer(i, ip, now);
                 }
                 if tcpip {
-                    let ip = self.peers[i].cfg.dev.ip.clone();
-                    self.tcpip(&s.serial, &ip, now);
+                    let to = self.peers[i].cfg.dev.adb_serial();
+                    self.tcpip(&s.serial, to, now);
                 }
             }
             devices::Join::Ignored => log!("adb: {} was removed before: not adding it again", s.serial),
@@ -1124,11 +1205,12 @@ impl App {
                 tray::notify(self.hwnd, &format!("{} without Wi-Fi", s.kind.label()),
                              "A device on USB has no Wi-Fi connection: connect it to Wi-Fi, then plug it in again.");
             }
+            devices::Join::Add { .. } if self.probing > 0 => log!("adb: {}: joins after the device being added", s.serial),
             devices::Join::Add { ip, tcpip } => {
-                let d = self.join_new(s.kind, s.id.clone(), ip, "", now);
+                let d = self.join_new(s.kind, s.id.clone(), ip, String::new(), "", now);
                 self.notify_joined(&d);
                 if tcpip {
-                    self.tcpip(&s.serial, &d.ip, now);
+                    self.tcpip(&s.serial, d.adb_serial(), now);
                 }
             }
         }
@@ -1164,7 +1246,8 @@ impl App {
         std::thread::spawn(move || clip::thread(name, ip, clip_rx, last, share_private, move |c| emit_wake(Ev::Clip(id, c))));
         self.peers.push(Peer { id, sw: Switch::new(cfg.dev.side, cfg.push_counts), cfg, sock, key: None, tx_seq: 0, rx_seq: 0,
                                dirty: false, last_send: now, launch, launch_at: None, server_pid: None, clip, clip_last,
-                               tab: None, heard: None, samples: VecDeque::new(), adb_status: "starting".into(), remote: false });
+                               tab: None, heard: None, samples: VecDeque::new(), adb_status: "starting".into(), adb_at: None,
+                               remote: false });
     }
 
     fn bye(&mut self, i: usize) {
@@ -1187,25 +1270,95 @@ impl App {
     /// (it takes the side at launch: warp corner, strip edge).
     fn set_place(&mut self, i: usize, side: Side, pos: u16) {
         let moved = side != self.peers[i].cfg.dev.side;
-        if moved {
-            self.bye(i);
-        }
         let p = &mut self.peers[i];
         log!("arrange: {} on the {} at {:.0}%", p.cfg.dev.name, side.name(), pos as f32 / 655.35);
         (p.cfg.dev.side, p.cfg.dev.pos) = (side, pos);
         self.save_devices();
-        let p = &mut self.peers[i];
         if moved {
-            p.sw = Switch::new(side, p.cfg.push_counts); // offline until the new server answers
+            self.restart(i);
         }
-        let relaunch = moved && !self.paused && p.cfg.dev.enabled;
-        if relaunch && p.cfg.dev.kind == Kind::Pc {
+    }
+
+    /// Stops device `i`'s server and starts a new one with its current settings (a PC: a new
+    /// session); offline until it answers.
+    fn restart(&mut self, i: usize) {
+        self.bye(i);
+        let p = &mut self.peers[i];
+        p.sw = Switch::new(p.cfg.dev.side, p.cfg.push_counts);
+        if self.paused || !p.cfg.dev.enabled {
+            return;
+        }
+        if p.cfg.dev.kind == Kind::Pc {
             self.launch(i, Instant::now());
-        } else if relaunch {
+        } else {
             p.launch_at = Some(Instant::now());
             p.adb_status = format!("restarting the {} server", p.cfg.dev.name);
             let _ = p.launch.send(adb::Request::Launch(p.cfg.clone()));
         }
+    }
+
+    /// Reads wadisplay.ini and devices.ini again and applies them. A device whose section (but for
+    /// its name and place along the edge, applied as they are) and settings (adb path, push_counts)
+    /// did not change keeps its server; the others restart theirs.
+    fn reload(&mut self, now: Instant) {
+        let (s, list) = Settings::load();
+        let (devices, ignored) = match list {
+            Ok(l) => l,
+            Err(e) => return tray::notify(self.hwnd, "Config not reloaded", &format!("{e}. Nothing changed.")),
+        };
+        if s.receive {
+            self.bye_all();
+            restart_as("receive");
+            self.quit = true;
+            return;
+        }
+        if s.adb != self.settings.adb {
+            // The old watcher ends with its channel.
+            let (watch, rx) = mpsc::channel();
+            let path = s.adb.clone();
+            std::thread::spawn(move || adb::watch(&path, rx, |f| emit_wake(Ev::Found(f))));
+            self.watch = watch;
+        }
+        if s.share_private != self.share_private {
+            self.share_private = s.share_private;
+            for p in &mut self.peers {
+                let _ = p.clip.send(clip::Cmd::SharePrivate(self.share_private));
+            }
+        }
+        self.remote.step = s.remote_step.max(1);
+        // pos is saved in whole percent, so a dragged device never reads back the same.
+        let same = |a: &Device, b: &Device| Device { name: b.name.clone(), pos: b.pos, ..a.clone() } == *b;
+        let mut i = 0;
+        while i < self.peers.len() {
+            let c = &self.peers[i].cfg;
+            if devices.iter().any(|d| same(&c.dev, d)) && c.adb == s.adb && c.push_counts == s.push_counts {
+                i += 1;
+            } else {
+                self.bye(i);
+                self.peers.remove(i);
+            }
+        }
+        self.settings = s;
+        // In the file's order: kept peers as they are, the rest new (their servers start on the next tick).
+        let mut old = std::mem::take(&mut self.peers);
+        let (mut kept, total) = (0, devices.len());
+        for d in devices {
+            match old.iter().position(|p| same(&p.cfg.dev, &d)) {
+                Some(k) => {
+                    let mut p = old.remove(k);
+                    if p.cfg.dev.name != d.name {
+                        let _ = p.clip.send(clip::Cmd::Name(d.name.clone()));
+                    }
+                    p.cfg.dev = d;
+                    self.peers.push(p);
+                    kept += 1;
+                }
+                None => self.add_peer(d, now),
+            }
+        }
+        self.ignored = ignored;
+        log!("reloaded the config: {total} devices, {kept} unchanged");
+        self.tip_at = now;
     }
 
     fn menu(&mut self) {
@@ -1221,7 +1374,9 @@ impl App {
                     let _ = p.clip.send(clip::Cmd::SharePrivate(self.share_private));
                 }
             }
+            tray::CMD_RELOAD => self.reload(Instant::now()),
             tray::CMD_CONNECT if self.paused => {
+                self.reload(Instant::now());
                 self.paused = false;
                 for p in &mut self.peers {
                     p.launch_at = None;
@@ -1296,9 +1451,9 @@ fn run(settings: Settings, devices: Vec<Device>, ignored: Vec<String>) {
 
     let now = Instant::now();
     let mut app = App {
-        hwnd, hider, peers: vec![], next_id: 0, ignored, watch, tcpip_at: HashMap::new(), me, paired, links, query_at: None,
+        hwnd, hider, peers: vec![], next_id: 0, ignored, watch, tcpip_at: HashMap::new(), probing: 0, me, paired, links, query_at: None,
         beacons: HashMap::new(), pairing: None, declined: vec![], st: PcState::default(), remote: Remote::new(settings.remote_step), park: None,
-        blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None, key_balance: 0,
+        blocked: false, blocked_at: now, wheel_acc: [0; 2], abs_prev: None, key_balance: 0, raw_vk: 0,
         hook_seen: capture::HOOK_KEYS.load(Relaxed), balance_since: None, share_private: settings.share_private, settings,
         paused: false, tip_at: now, stats_at: now, quit: false,
     };
@@ -1313,6 +1468,9 @@ fn run(settings: Settings, devices: Vec<Device>, ignored: Vec<String>) {
         let mut msg = MSG::default();
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if arrange::dialog_message(&msg) {
+                    continue;
+                }
                 let _ = TranslateMessage(&msg); // characters (and IME input) for the arrange window's fields
                 DispatchMessageW(&msg);
             }
@@ -1327,6 +1485,21 @@ fn run(settings: Settings, devices: Vec<Device>, ignored: Vec<String>) {
     tray::remove(hwnd);
     capture::unpark(hider, app.park.and_then(|p| p.1), None);
     log!("quit");
+}
+
+/// Exe name of the foreground window's process: another program's keyboard hook, or a window of
+/// higher integrity than ours, keeps keys from our hook.
+fn foreground_exe() -> String {
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+        let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return format!("pid {pid}") };
+        let (mut buf, mut n) = ([0u16; 260], 260);
+        let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
+        let _ = CloseHandle(p);
+        let path = String::from_utf16_lossy(&buf[..n as usize]);
+        if ok { path.rsplit('\\').next().unwrap_or_default().to_string() } else { format!("pid {pid}") }
+    }
 }
 
 /// `--bench [seconds]`: jiggles the device pointer by 1 count at 500 Hz and reports
@@ -1408,7 +1581,12 @@ fn main() {
         let _ = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s as *const _ as _,
                                       std::mem::size_of_val(&s) as u32);
     }
-    let (settings, devices, ignored) = Settings::load();
+    let (settings, list) = Settings::load();
+    let (devices, ignored) = match list {
+        Ok(l) => l,
+        Err(e) => return message_box(&format!("{e}\n\nwadisplay leaves it as it is: save it as UTF-8 (or delete it), then start \
+                                               wadisplay again.")),
+    };
     let args: Vec<String> = std::env::args().collect();
     match args.iter().position(|a| a == "--bench") {
         // The first device only.

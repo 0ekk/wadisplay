@@ -1073,3 +1073,191 @@ under "Open checks".
   disabled device, `ini_repairs_names_and_skips_devices_without_ip` checks the enabled default);
   release build without warnings. Live check (by the user): disable a device, see it pale and its
   server gone, restart wadisplay, enable it again.
+
+### adb serial per device (2026-10-28)
+- Rationale (user request): adb should reach a device on a port of the user's choosing, or over
+  its USB cable by serial, instead of always `<ip>:5555`.
+- Decisions:
+  - `Device::adb`, saved as `adb=` in each `[device]` section of `devices.ini`: empty (the default,
+    and what existing files get) means `ip:5555`; `ip:port` means adb over TCP on that port; a value
+    without a colon is a USB serial as `adb devices` lists it, used as is (no `adb connect`; "plug
+    it in" when it is missing). `Device::adb_serial` is what every adb call uses. Data still goes
+    over the LAN (UDP state, TCP clipboard to `ip`): adb is only for deploy, launch and revive.
+  - Arrange window: the Add field takes an IPv4 address (port 5555), `IP:port` or a USB serial
+    (`devices::add_target`; dotted digits that are no address are refused, not taken as a serial).
+    adb probes that serial and reads the kind, serial number and LAN address; a USB serial needs a
+    LAN address (`devices::reached`). If the probed device is already known (same serial number or
+    address), Add switches it to the new adb serial instead of refusing, so this is also how an
+    existing device's connection is changed (no new UI).
+  - Auto-join (user choice from the options offered): a new device on USB is still switched to
+    `adb tcpip 5555`. A known device with an `ip:port` serial is switched to that port (`tcpip
+    <port>`, then `connect ip:port`) unless that serial is already online; one with a USB serial
+    is never switched. `Seen::wifi` became `Seen::online`, every serial adb lists as `device`.
+  - An address change (DHCP, `move_peer`) moves an `ip:port` serial along (`Device::set_ip`); a
+    USB serial stays.
+  - Hovering a device box in the arrange window shows how it is connected (user request, same
+    day): `Device::link`, e.g. "adb over USB: <serial>" plus "Input and clipboard over Wi-Fi:
+    <ip>", or "Paired PC at <ip>", carried in `arrange::Item::link`. A standard tooltip control
+    (`TTS_ALWAYSTIP`, `TTF_SUBCLASS`) has one tool per box rect; `sync_tips` after each paint
+    registers them again only when a rect or text changed, so an open tip stays, and drops them
+    while a box is pressed, so no tip pops up mid-drag.
+  - Right-click > "Connection..." edits it in place (user request, same day; not for PCs): a field
+    over the box like Rename, holding the current adb serial (`arrange::Item::adb`); Enter or
+    clicking away keeps it, Esc cancels, the Add field's rules apply (`devices::add_target`). No
+    probe first, so a port the device does not listen on yet can be set: `Ev::Connect` saves it
+    (`devices::reached`; an `ip:port` with another address moves the device) and restarts the
+    server through it (`App::restart`, shared with a side change), and the watcher reports every
+    device again (`adb::Watch::Rescan`), so one on USB right now is switched to the new port
+    without replugging; until then the launch fails and retries every 10 s as before.
+- Impact: PC only (`devices.rs`, `adb.rs`, `main.rs`, `arrange.rs`); no protocol, server or APK
+  change. `adb::probe` now returns the LAN address; the watcher's channel carries `adb::Watch`
+  (`Tcpip` with `ip:port`, or `Rescan`).
+- Verification: `cargo.exe test -p wadisplay-pc` 32 passed, new `adb_serials` (default and custom
+  serials, moves, Add field parsing, `reached`, `link` texts) and `joining` cases for another port
+  (switched, online, port following a move) and a USB serial (never switched); release build
+  without warnings. Live (user's screenshot): the tooltip on a tablet set to its USB serial, in
+  dark mode. Untested live: a device on a custom port, the Connection field.
+
+### Tray menu and arrange window in the Windows app mode (2026-10-28)
+- Rationale (user request): the tray menu was light on a dark Windows (`AppsUseLightTheme=0`).
+- Decisions: before each tray menu, `tray::theme_menus` reads `HKCU\Software\Microsoft\Windows\
+  CurrentVersion\Themes\Personalize\AppsUseLightTheme` (missing: light) and calls uxtheme's
+  undocumented `SetPreferredAppMode` (ordinal 135; ForceDark or ForceLight) and `FlushMenuThemes`
+  (136). Reading it each time makes a mode change show on the next menu without listening for
+  `WM_SETTINGCHANGE`. Missing ordinals leave the menu light. Both roles share `tray::track`, so
+  the receiver's menu follows too, and the arrange window's right-click menu calls it as well
+  (the mode is per process, so it would otherwise depend on whether the tray menu opened first). Only light/dark: Windows 11's own menus do not use the accent
+  colour either.
+- The arrange window follows the app mode too (user request, same day): `tray::dark` (the same
+  registry value) sets `State::dark` when the window opens and again on `WM_SETTINGCHANGE` when it
+  changed. Dark: the documented `DWMWA_USE_IMMERSIVE_DARK_MODE` title bar, the scene in
+  `arrange::colors` (background #202020, monitors and offline/disabled boxes in darker greys,
+  online boxes stay accent blue), the Add and rename fields through `WM_CTLCOLOREDIT` (the stock
+  DC brush, so no brush to free), and the Add button and the tooltip with the `DarkMode_Explorer`
+  theme. Light keeps the old colours, as constants instead of system colours. The Remove
+  confirmation (`MessageBoxW`) stays light: Windows has no dark message box.
+- Impact: PC only (`tray.rs`, `arrange.rs`); `windows` features `Win32_System_Registry` and
+  `Win32_Graphics_Dwm` (no new crate).
+- Verification: release build without warnings; both ordinals resolve in `uxtheme.dll` on the
+  user's Windows 11 (checked with `GetProcAddress`). Untested live: the menus and the
+  arrange window in dark mode (the exe needs the UAC prompt).
+
+### Reload config (2026-10-28)
+- Rationale (user request): apply edits to `wadisplay.ini` and `devices.ini` without restarting
+  the exe (which asks for UAC every start), and pick them up when reconnecting after Disconnect.
+- Decisions:
+  - Tray item "Reload config" (`CMD_RELOAD`, above Connect/Disconnect) runs `App::reload`, and
+    Connect after Disconnect runs it before launching again.
+  - `App::reload` reads both files with `Settings::load`. `role=receive` restarts as a receiver
+    (as the tray item does). A new `adb` path starts a new watcher (the old one ends with its
+    channel); `private_clipboard` goes to the clipboard threads; `remote_step` applies at once.
+  - Devices: one whose section is unchanged but for `name` and `pos`, with the same `adb` path and
+    `push_counts`, keeps its peer and server; its new name and place are applied in place (a rename
+    restarts nothing elsewhere either, and `pos` is saved in whole percent, so a dragged device
+    never reads back equal). Any other change (side, kind, id, ip, adb serial, enabled) sends Bye
+    and makes a new peer, whose server starts on the next tick; devices gone from the file are
+    dropped. The list takes the file's order; `[ignored]` is replaced.
+  - `devices.ini` that exists but cannot be read (not UTF-8, e.g. saved as GBK, or locked) is no
+    longer treated as missing, which overwrote it with an empty list: `Settings::load` returns the
+    error, reload changes nothing and says so in a notification, and the start-up shows a message
+    box and quits.
+  - Headers: `wadisplay.ini` says to use Reload config after editing; `devices.ini` says wadisplay
+    rewrites it on every change (quit first, or reload right after saving) and to save it as UTF-8.
+- Impact: PC only (`main.rs`, `tray.rs`, `devices.rs` header). A reload drops at most the changed
+  devices' sessions; removed peers' UDP readers stay blocked, as for Remove (`ponytail:` in
+  `add_peer`).
+- Verification: `cargo.exe test -p wadisplay-pc` 32 passed; release build without warnings.
+  Untested live: Reload config with a changed and an unchanged device, Connect after Disconnect,
+  the GBK refusal.
+
+### Address changes on USB, and adb found through mDNS (2026-10-28)
+- Rationale (user request): a device reached by its USB serial had its LAN address read only when
+  added (or when it reappeared in `adb devices`), so a DHCP change while it stayed plugged in left
+  input and the clipboard going to the old address, the server "running but not answering"; and adb
+  should be able to find a device through `adb mdns services`, whose ports (wireless debugging)
+  change on every toggle.
+- Findings: with platform-tools 37.0.1 (`adb mdns check`: "adb discovery 0.0.0") the tablet shows in
+  `adb mdns services` as `adb-<serial>` (`_adb._tcp`, port 5555) and as `adb-<serial>-<suffix>`
+  (`_adb-tls-connect._tcp`) three times, numbered " (2)" and " (3)", on three ports of which one
+  was connected; the D-section finding that adbd in TCP mode advertises nothing no longer holds. Lines
+  are name, type and address, tab-separated. Minutes later the list was empty while the device
+  still answered on its wireless debugging port: adb's list is not reliable on its own.
+- Decisions:
+  - Address: `adb::Event::Launched` and `Running` (the check of a silent server, which now also runs
+    `devices::ADDRESSES` in the same shell call, cheaper than the full `IDENTIFY`) carry the LAN
+    address the device reports (`devices::lan`, split out of `identity`). For a device whose adb
+    serial holds no address (USB serial or mDNS), another address moves it there (`move_peer`; the
+    new peer's server starts on the next tick). Devices reached at `ip:port` keep their address: adb
+    reaching it there says it is right, and a device with Wi-Fi and Ethernet may report the other.
+  - `adb=mdns` (`devices::MDNS`): `Adb::connect` looks the device up by its serial number,
+    `adb-<id>` or `adb-<id>-<suffix>` (`devices::mdns_addresses`), wireless debugging before adb over
+    Wi-Fi, plus any serial online in `adb devices` at the device's last address (for when adb's list
+    is empty); it tries those already online first, then `adb connect`s the others, and the first
+    online one is the serial for that request. Never switched to `adb tcpip`. Tooltip: "adb over
+    Wi-Fi, found by adb mdns services as adb-<id>". Pairing (`adb pair`) stays manual; the error
+    says so.
+  - Add and Connection fields take `mdns`, or a name from `adb mdns services` (with or without " (2)"
+    or the service type), probed as `mdns:<name>` and saved as `mdns` once the probe read the serial
+    number. Add by `mdns` alone fails: there is no serial number to look up.
+  - While an Add probes, devices the watcher reports do not join by themselves (`App::probing`);
+    each finished probe makes the watcher report every device again (`Watch::Rescan`). Before, a
+    device added at a wireless debugging port could be auto-joined meanwhile and switched to
+    `adb tcpip 5555`, which ends wireless debugging.
+- Impact: PC only (`devices.rs`, `adb.rs`, `main.rs`, `arrange.rs`).
+- Verification: `cargo.exe test -p wadisplay-pc` 33 passed, new `mdns` (the listing shape above with
+  repeats, a trailing dot, a pairing service, another serial number sharing the prefix and an IPv6
+  address; Add field names; `reached`; tooltip; never switched); `identity_of_a_device` still passes
+  on the split-out `lan`. Release build without warnings. Untested live: a lookup through mDNS, an
+  address change on USB.
+
+### Connection window (2026-10-28)
+- Rationale (user request): choosing a connection by typing a serial or name is error-prone; pick
+  the kind first, then a value adb found, and see where an mDNS lookup actually connected.
+- Decisions:
+  - Right-click > "Connection..." opens a small window (owned by the arrange window, one at a time,
+    title "<name>: adb connection") instead of the inline field: a type list (`devices::Via`:
+    serial, ip:port, mdns), an editable value list (`CBS_DROPDOWN`), a hint line for the type, OK
+    and Cancel. It is modeless, so device control goes on; the main loop gives it Tab, Enter and Esc
+    through `IsDialogMessageW` (`arrange::dialog_message`). The inline rename field is back to
+    names only.
+  - The value list holds what adb finds for the chosen type: `adb::discover` runs `adb devices` and
+    `adb mdns services` off the main thread when the window opens (`Ev::Discover`), and
+    `devices::discovered` sorts them: USB serials, `ip:port` (connected or advertised), mDNS names
+    (advertised, or connected by adb itself as `<name>._adb...`). Switching the type fills the
+    field with the device's value for it (`Device::connection`: its own, else its serial number,
+    `ip:5555` or `adb-<serial number>`); a late discovery refills the list and keeps what is typed.
+  - `devices::via_serial` checks a value for its type: ip:port takes an address with an optional
+    port (5555), mdns an `adb-...` name (empty: by serial number). OK on the value first shown
+    changes nothing; a bad value is explained in the hint line and the window stays.
+  - `adb=mdns:<name>` is now kept as chosen (it was saved as plain `mdns`), so a picked name is
+    the one looked up; `mdns` alone still looks the device up by its serial number. The Add field
+    takes the same forms, guessed by `devices::add_target` and checked by `via_serial`.
+  - Tooltip of an mDNS device: "adb over Wi-Fi via mDNS (<name>): <ip:port>", the address adb last
+    reached it at (`adb::Reach::at` on `Launched` and `Running`, kept in `Peer::adb_at`, cleared
+    when the connection changes), or "not found yet".
+  - Dark mode: the window follows `State::dark` like the arrange window (title bar, combo boxes with
+    the `DarkMode_CFD` theme, buttons `DarkMode_Explorer`, `ctl_color` for fields, lists and the
+    hint), and a mode change re-themes both.
+- Impact: PC only (`devices.rs`, `adb.rs`, `main.rs`, `arrange.rs`). `adb::Event::Launched` and
+  `Running` carry `adb::Reach` (where adb reached the device, and its LAN address).
+- Verification: `cargo.exe test -p wadisplay-pc` 34 passed, new `connection_fields` (type and values
+  per connection, `via_serial` per type with the default port, `discovered` from `adb devices` and
+  `adb mdns services` shapes); `mdns` updated for names kept as chosen and the tooltip with and
+  without an address. Release build without warnings. Live: switching the tablet to `mdns` in the
+  window logged `arrange: <name> now uses adb at mdns` and relaunched its server. Untested live:
+  the value lists, Tab, Enter and Esc, dark mode, the mDNS tooltip address.
+
+### Keyboard hook misses: which key and which program (2026-10-28)
+- Rationale (user report): with the tablet on its lock screen the pointer no longer went across.
+  The log showed `screen_on false` for most of the run (an always-on display can look like the lock
+  screen), so the edges were off by decision 11; with the screen on and locked, entry worked. The
+  way in, Ctrl+Alt+Space, did not reach the keyboard hook: "keyboard hook missed 1 key events" came
+  in pairs 100 to 150 ms apart (one key's press and release) while Raw Input saw a keyboard device,
+  and reinstalling the hooks did not help the next press. Most likely another program's low-level
+  hook swallows that key combination before ours, or a window of higher integrity has focus.
+- Decision: no fix until the source is known. The "keyboard hook missed" line now names the
+  virtual-key code of the last Raw Input key event (`capture::Raw::Key(vk)`, `App::raw_vk`) and
+  the exe of the foreground window's process (`foreground_exe`).
+- Impact: PC only (`capture.rs`, `main.rs`), log text only.
+- Verification: release build without warnings. Pending live: press Ctrl+Alt+Space with the tablet
+  screen off and read the line.

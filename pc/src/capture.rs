@@ -181,7 +181,8 @@ pub fn register_raw_input(hwnd: HWND) {
 pub enum Raw {
     /// Relative counts, or an absolute 0..65535 position (remote desktop sends those).
     Mouse { x: i32, y: i32, absolute: bool },
-    Key,
+    /// A keyboard event; its virtual-key code.
+    Key(u16),
 }
 
 pub fn read_raw(lp: LPARAM) -> Option<Raw> {
@@ -202,7 +203,9 @@ pub fn read_raw(lp: LPARAM) -> Option<Raw> {
         // VKey 0xFF: the second half of E1 sequences (Pause), which hooks never see. No device:
         // injected by software (an IME typing into our own window, say), which this elevated
         // process's hooks need not see either; only keyboards count towards "hooks lost".
-        t if t == RIM_TYPEKEYBOARD.0 && unsafe { ri.data.keyboard.VKey } != 0xFF && !ri.header.hDevice.is_invalid() => Some(Raw::Key),
+        t if t == RIM_TYPEKEYBOARD.0 && unsafe { ri.data.keyboard.VKey } != 0xFF && !ri.header.hDevice.is_invalid() => {
+            Some(Raw::Key(unsafe { ri.data.keyboard.VKey }))
+        }
         _ => None,
     }
 }
