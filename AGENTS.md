@@ -66,7 +66,8 @@ Windows `adb.exe` reads stdin in text mode (byte 0x1A ends it) and turns LF into
   remove, hover to see how it is connected; it opens by itself while there are none), sets whether private clipboard text stays on the PC, and
   "Reload config" re-reads both ini files (Connect after Disconnect does too). A device that shows up in `adb devices` (plugged in by USB, or
   connected by hand) joins by itself unless it was removed before; one on USB is switched to
-  `adb tcpip` on its port (5555 unless set). For each device it connects adb to its `adb=` serial
+  `adb tcpip` on its port (5555 unless set; 5555 for an `mdns` one with nothing answering at its
+  address, so after a tablet reboot plugging it in once brings it back). For each device it connects adb to its `adb=` serial
   in `devices.ini` (empty: `<ip>:5555`; a USB serial is used as is; `mdns` looks it up by serial number in
   `adb mdns services`), tells its kind and serial
   number, deploys the server/APK when their hashes change and launches the server.

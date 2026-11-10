@@ -229,13 +229,15 @@ pub enum Join {
 /// What to do with a device adb just reported. It is a known one if its serial number or LAN
 /// address matches. One whose adb serial is `ip:port` (new ones: port 5555) and not online, such as
 /// one on USB or over wireless debugging, is switched to adb over Wi-Fi on that port; one reached by
-/// its USB serial never is.
+/// its USB serial never is. One found through mDNS is switched to port 5555, but only from USB and
+/// with nothing online at its address: after a reboot, as wireless debugging does not come back.
 pub fn join(devices: &[Device], ignored: &[String], s: &Seen) -> Join {
     let ip = match s.serial.rsplit_once(':') {
         Some((ip, _)) => Some(ip.to_string()),
         None => s.ip.clone(),
     };
     let tcpip = |serial: &str| ip.is_some() && serial.contains(':') && !s.online.iter().any(|o| o == serial);
+    let at = |ip: &str| s.online.iter().any(|o| o.rsplit_once(':').is_some_and(|(h, _)| h == ip));
     let known = devices.iter().position(|d| (!s.id.is_empty() && d.id == s.id) || ip.as_deref() == Some(d.ip.as_str()));
     match (known, ip.clone()) {
         (Some(i), ip) => {
@@ -244,7 +246,11 @@ pub fn join(devices: &[Device], ignored: &[String], s: &Seen) -> Join {
             if let Some(ip) = &ip {
                 d.set_ip(ip.clone());
             }
-            Join::Known { i, ip, id: (d.id != s.id && !s.id.is_empty()).then(|| s.id.clone()), tcpip: tcpip(&d.adb_serial()) }
+            let tcpip = match d.connection().0 {
+                Via::Mdns => s.ip.is_some() && !s.serial.contains(':') && !at(&d.ip),
+                _ => tcpip(&d.adb_serial()),
+            };
+            Join::Known { i, ip, id: (d.id != s.id && !s.id.is_empty()).then(|| s.id.clone()), tcpip }
         }
         (None, _) if !s.id.is_empty() && ignored.contains(&s.id) => Join::Ignored,
         (None, None) => Join::NoNetwork,
@@ -287,7 +293,7 @@ pub struct Device {
     /// Its serial number (`ro.serialno`), once adb has read it; tells the device on USB.
     pub id: String,
     pub ip: String,
-    /// How adb reaches it: empty for `ip:5555`, else `ip:port`, a USB serial or `MDNS` (no Wi-Fi switch).
+    /// How adb reaches it: empty for `ip:5555`, else `ip:port`, a USB serial, `MDNS` or `mdns:<name>`.
     pub adb: String,
     pub side: Side,
     /// Where it sits along its edge: its middle, as a fraction (0..=65535) from the left or top end.
@@ -300,6 +306,15 @@ impl Device {
     /// The serial adb reaches it by.
     pub fn adb_serial(&self) -> String {
         if self.adb.is_empty() { format!("{}:5555", self.ip) } else { self.adb.clone() }
+    }
+
+    /// Where `join`'s switch to adb over Wi-Fi puts it: its adb serial, or `ip:5555` for one found
+    /// through mDNS, which finds it there (`_adb._tcp`, or online at its address).
+    pub fn tcpip_serial(&self) -> String {
+        match self.connection().0 {
+            Via::Mdns => format!("{}:5555", self.ip),
+            _ => self.adb_serial(),
+        }
     }
 
     /// How the PC reaches it, for the arrange window's tooltip; `at` is where adb last reached it,
@@ -556,6 +571,20 @@ mod tests {
         let mut moved = seen("A", "A", Some("192.0.2.9"), false);
         moved.online.push("192.0.2.9:5556".into());
         assert_eq!(j(moved), Join::Known { i: 0, ip: Some("192.0.2.9".into()), id: None, tcpip: false }, "port follows the move");
+        // Found through mDNS: switched to 5555 from USB after a reboot, also with a name chosen;
+        // not while anything answers at its address, nor over wireless debugging.
+        let mut list = [dev("A", "192.0.2.1"), dev("B", "192.0.2.2")];
+        (list[0].adb, list[1].adb) = (MDNS.into(), "mdns:adb-B-x".into());
+        let j = |s: Seen| join(&list, &[], &s);
+        assert_eq!(j(seen("A", "A", Some("192.0.2.1"), false)), Join::Known { i: 0, ip: None, id: None, tcpip: true });
+        assert_eq!(j(seen("B", "B", Some("192.0.2.2"), false)), Join::Known { i: 1, ip: None, id: None, tcpip: true });
+        assert_eq!(list.each_ref().map(|d| d.tcpip_serial()), ["192.0.2.1:5555", "192.0.2.2:5555"]);
+        assert_eq!(j(seen("A", "A", Some("192.0.2.1"), true)), Join::Known { i: 0, ip: None, id: None, tcpip: false });
+        let mut tls = seen("A", "A", Some("192.0.2.1"), false);
+        tls.online.push("192.0.2.1:41235".into());
+        assert_eq!(j(tls), Join::Known { i: 0, ip: None, id: None, tcpip: false });
+        assert_eq!(j(seen("192.0.2.1:41235", "A", Some("192.0.2.1"), false)), Join::Known { i: 0, ip: None, id: None, tcpip: false });
+        assert_eq!(j(seen("A", "A", None, false)), Join::Known { i: 0, ip: None, id: None, tcpip: false }, "no LAN address");
     }
 
     #[test]
@@ -645,8 +674,10 @@ mod tests {
         assert_eq!(d.link(Some("192.0.2.7:39947")),
                    "adb over Wi-Fi via mDNS (adb-SER1): 192.0.2.7:39947\nInput and clipboard over Wi-Fi: 192.0.2.7");
         assert!(d.link(Some("mdns")).starts_with("adb over Wi-Fi via mDNS (adb-SER1): not found yet\n"));
-        // Never switched to adb tcpip, on USB or not.
-        assert_eq!(join(&[d], &[], &seen("SER1", "SER1", Some("192.0.2.7"), false)),
+        // Switched to adb tcpip from USB only (more in `joining`).
+        assert_eq!(join(&[d.clone()], &[], &seen("SER1", "SER1", Some("192.0.2.7"), false)),
+                   Join::Known { i: 0, ip: None, id: None, tcpip: true });
+        assert_eq!(join(&[d], &[], &seen("192.0.2.7:39947", "SER1", Some("192.0.2.7"), false)),
                    Join::Known { i: 0, ip: None, id: None, tcpip: false });
     }
 

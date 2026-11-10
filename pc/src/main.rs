@@ -1195,7 +1195,7 @@ impl App {
                     self.move_peer(i, ip, now);
                 }
                 if tcpip {
-                    let to = self.peers[i].cfg.dev.adb_serial();
+                    let to = self.peers[i].cfg.dev.tcpip_serial();
                     self.tcpip(&s.serial, to, now);
                 }
             }

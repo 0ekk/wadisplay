@@ -153,7 +153,7 @@ impl Adb<'_> {
         }
         self.serial = devices::MDNS.into();
         Err(format!("adb mdns services lists no address of {want} that answers ({name}: wireless debugging or adb over \
-                     Wi-Fi off? Wireless debugging also needs adb pair once)"))
+                     Wi-Fi off? After a {name} reboot, plug it in by USB once. Wireless debugging may also need adb pair once)"))
     }
 
     /// Serial number, LAN address and kind.

@@ -1193,7 +1193,8 @@ under "Open checks".
     `adb-<id>` or `adb-<id>-<suffix>` (`devices::mdns_addresses`), wireless debugging before adb over
     Wi-Fi, plus any serial online in `adb devices` at the device's last address (for when adb's list
     is empty); it tries those already online first, then `adb connect`s the others, and the first
-    online one is the serial for that request. Never switched to `adb tcpip`. Tooltip: "adb over
+    online one is the serial for that request. Never switched to `adb tcpip` (superseded: from USB
+    it is, see "mDNS devices after a reboot"). Tooltip: "adb over
     Wi-Fi, found by adb mdns services as adb-<id>". Pairing (`adb pair`) stays manual; the error
     says so.
   - Add and Connection fields take `mdns`, or a name from `adb mdns services` (with or without " (2)"
@@ -1261,3 +1262,44 @@ under "Open checks".
 - Impact: PC only (`capture.rs`, `main.rs`), log text only.
 - Verification: release build without warnings. Pending live: press Ctrl+Alt+Space with the tablet
   screen off and read the line.
+
+### mDNS devices after a reboot (2026-11-11)
+- Rationale (user report): adb over Wi-Fi did not come back after a tablet reboot. The tablet's
+  connection is `mdns`; after the reboot neither `adb tcpip` nor wireless debugging was on
+  (`service.adb.tcp.port` empty, `adb_wifi_enabled` 0), and plugging it in did nothing, as mDNS
+  devices were never switched to `adb tcpip`.
+- Findings (tablet, HarmonyOS 4 / API 31, as shell):
+  - `setprop persist.adb.tcp.port 5555` and `persist.adb.tls_server.enable 1`: "Failed to set
+    property". No persistent adb port without root.
+  - `settings put global adb_wifi_enabled 1` falls back to 0 at once: the Wi-Fi is not trusted for
+    wireless debugging, and the system cannot ask (logcat: `AdbDebuggingManager: Unable to start
+    customAdbWifiNetworkConfirmation...Component com.android.systemui/...WifiDebuggingActivity`).
+  - Shell holds NETWORK_SETTINGS and MANAGE_DEBUGGING: a helper under `app_process` read the real
+    BSSID (`IWifiManager.getConnectionInfo`; `dumpsys wifi`, `cmd wifi` and scan results mask it)
+    and called `IAdbManager.allowWirelessDebugging(true, bssid)`, which trusted the network
+    (`wifiAP` in the adb keystore) and turned wireless debugging on. The PC's adb key, allowed over
+    USB, was accepted over TLS without `adb pair`.
+  - A companion `BOOT_COMPLETED` receiver (WRITE_SECURE_SETTINGS granted with `pm grant`) to turn it
+    on whenever Wi-Fi connects: HarmonyOS drops broadcasts to it (`BroadcastQueue: enter
+    shouldPreventSendBroadcast`, "Skipped (manifest)") until the app is allowed in Settings > Apps >
+    App launch. With that allowed it worked, but after a reboot the keystore holds no `wifiAP` again
+    (1 before, 0 after, unlocked, same access point) and enabling falls back to 0: HarmonyOS forgets
+    the trusted Wi-Fi on boot. Wireless debugging cannot come back by itself either.
+- Decisions:
+  - USB once after a reboot stays (decision 1), for mDNS devices too: `devices::join` switches one
+    whose connection is mDNS (`mdns` or `mdns:<name>`) to `adb tcpip 5555` when it shows up on USB
+    with a LAN address and nothing online at that address. Not over wireless debugging, nor while
+    another connection answers there. `Device::tcpip_serial` is where the switch connects (`ip:5555`
+    for mDNS, else the adb serial); `connect_mdns` then finds it as `_adb._tcp` or online at its
+    address. This also stops a `mdns:<name>` device on USB from getting `adb tcpip <name>`.
+  - The mDNS error names the reboot: "After a <name> reboot, plug it in by USB once"; "adb pair"
+    became "may also need" (not needed here).
+  - Rejected and removed: the trust helper and the boot receiver (no gain across a reboot, and they
+    need a HarmonyOS App launch exception and WRITE_SECURE_SETTINGS).
+- Impact: PC only (`devices.rs`, `main.rs`, `adb.rs` message). The APK is unchanged.
+- Verification: `cargo.exe test -p wadisplay-pc` 34 passed (`joining`: mDNS on USB switched, also
+  with a name; not with `ip:5555` or a wireless debugging port online at its address, not seen over
+  wireless debugging, not without a LAN address; `tcpip_serial`; `mdns` updated), `cargo test`
+  proto + server passed, release build without warnings. Live: tablet rebooted, plugged in, new exe
+  started: `adb: <serial>: switching to adb over Wi-Fi (<tablet-ip>:5555)` at 0.2 s, companion
+  redeployed, `wadisplay-server started` and the clipboard connected at 32.8 s.
